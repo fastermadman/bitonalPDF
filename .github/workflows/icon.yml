@@ -1,0 +1,30 @@
+name: compile-icon
+on:
+  push:
+    branches: [tahoe-icon]
+  workflow_dispatch:
+jobs:
+  icon:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          xcrun --find actool
+      - name: Compile .icon to Assets.car
+        run: |
+          mkdir -p build
+          xcrun actool assets/AppIcon.icon \
+            --compile build \
+            --output-format human-readable-text --notices --warnings --errors \
+            --output-partial-info-plist build/partial.plist \
+            --app-icon AppIcon --include-all-app-icons \
+            --target-device mac --platform macosx --minimum-deployment-target 26.0
+          ls -la build
+          cat build/partial.plist
+          xcrun assetutil --info build/Assets.car | head -60
+      - uses: actions/upload-artifact@v4
+        with:
+          name: icon
+          path: build/
