@@ -8,15 +8,22 @@
         {
           "image-name": "logo.svg",
           "name": "logo",
-          "fill": {
-            "solid": "srgb:0.00000,0.00000,0.00000,1.00000"
-          },
-          "fill-specializations": [
+          "hidden": false,
+          "hidden-specializations": [
             {
               "appearance": "dark",
-              "value": {
-                "solid": "srgb:1.00000,1.00000,1.00000,1.00000"
-              }
+              "value": true
+            }
+          ]
+        },
+        {
+          "image-name": "logo-dark.svg",
+          "name": "logo-dark",
+          "hidden": true,
+          "hidden-specializations": [
+            {
+              "appearance": "dark",
+              "value": false
             }
           ]
         }
