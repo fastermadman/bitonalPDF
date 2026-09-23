@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/logo.svg" alt="bitonalPDF" width="360"></p>
+
 # bitonalPDF
 
 Shrink scanned PDFs on macOS without hurting the text. A 59 MB, 166-page book scan became 9 MB and
