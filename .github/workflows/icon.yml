@@ -1,7 +1,5 @@
 name: compile-icon
 on:
-  push:
-    branches: [tahoe-icon]
   workflow_dispatch:
 jobs:
   icon:

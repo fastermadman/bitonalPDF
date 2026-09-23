@@ -53,3 +53,10 @@ MODE=images ./bitonalpdf.sh book.pdf        # colour mode
 ## License
 
 [AGPL-3.0](LICENSE). `poppler` and `imagemagick` are run as separate programs, not linked.
+
+## App icon
+
+macOS 26 puts legacy `.icns` icons in a grey plate. The icon is therefore an Icon Composer document
+(`assets/AppIcon.icon`) compiled to `assets/compiled/Assets.car`. The compile needs Xcode's `actool`, so
+it runs in the manual **compile-icon** GitHub workflow (Actions → compile-icon → Run workflow); download
+the artifact into `assets/compiled/` and run `./build.sh`.
