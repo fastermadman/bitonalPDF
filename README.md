@@ -25,6 +25,7 @@ macOS only. Needs [Homebrew](https://brew.sh) packages:
 
 ```bash
 brew install poppler imagemagick
+brew install tesseract         # optional, only needed for --rotate
 git clone https://github.com/FasterMadman/bitonalPDF && cd bitonalPDF
 ./build.sh            # builds bitonalPDF.app; drag it to ~/Applications
 ```
@@ -33,9 +34,9 @@ The app is not notarised, so macOS asks for confirmation the first time (right-c
 
 ## Use
 
-**Droplet:** drop one or more PDFs on `bitonalPDF.app`, choose *Pure text* or *With pictures*, follow
-the progress bar in the Dock. The result lands next to the original as `<name>.1bit.pdf` or
-`<name>.shrunk.pdf`. The original is never touched.
+**Droplet:** drop one or more PDFs on `bitonalPDF.app`, choose *Pure text* or *With pictures*, tick any
+preprocessing you want, follow the progress bar in the Dock. The result lands next to the original as
+`<name>.1bit.pdf` or `<name>.shrunk.pdf`. The original is never touched.
 
 **Terminal:**
 
@@ -45,9 +46,44 @@ MODE=images ./bitonalpdf.sh book.pdf        # colour mode
 ./bitonalpdf.sh scan.pdf out.pdf 65         # bolder text (threshold %, default 60)
 ```
 
+### Preprocessing (rotate, crop, split, deskew)
+
+Scans that are rotated 90°, contain two book pages per PDF page, or are skewed give bad results
+downstream (OCR, text extraction). These are opt-in flags, applied per page in this order —
+**rotate → crop → split → deskew** — before the threshold step above:
+
+```bash
+./bitonalpdf.sh --rotate --crop --split auto --deskew reading-list.pdf
+```
+
+| Flag | What it does |
+|---|---|
+| `--rotate` | Detects pages lying on their side or upside down (Tesseract OSD) and rotates them upright. Needs `tesseract`; skipped with a warning if it's not installed, or if a page has too little text to read its orientation. |
+| `--crop` | Trims scanner/microfilm borders. Uses one crop box for the whole document (the median across pages), so pages come out a uniform size. |
+| `--split auto\|off\|N%` | Cuts two-page spreads into separate pages. `auto` detects double pages and the gutter (spine) position per page, using the document-wide median as a fallback for pages it isn't sure about. `N%` (e.g. `--split 52%`) skips detection and forces the gutter at that position on every double-shaped page — use it when `auto` gets a document wrong. Default `off`. |
+| `--deskew` | Straightens each resulting page (small-angle rotation), after splitting. |
+
+Double-page detection is a best-effort heuristic (aspect ratio + a column-brightness profile of the
+page, looking for the gap between the two text blocks). It's deliberately conservative: a normal
+page or a wide table/figure is never cut in half, and a page that *looks* like a double page but
+where no gutter can be found with confidence is **left unsplit and flagged** rather than guessed —
+the script exits with status 2 and lists the page numbers on stderr (the PDF is still written; check
+those pages by hand, or re-run with `--split N%`).
+
+Verify the output on your own scans before trusting this on a large batch — the thresholds it uses
+are tuned on synthetic test pages, not a corpus of real scans.
+
+### Not implemented
+
+Adding a hidden OCR text layer (`--ocr`, e.g. via `ocrmypdf`) so the output PDF itself is searchable
+is intentionally left out for now — it doesn't help a markdown-extraction pipeline (which reads the
+PDF directly, not any embedded text layer) and only matters for reading the PDF in a viewer.
+
 ## Known limits
 
-- Not tested on double-page scans or badly rotated pages (they stay as they are).
+- Preprocessing accuracy depends on real scans varying a lot; treat `--split auto` results as a
+  starting point and spot-check the output, especially on unusual layouts (multi-column articles,
+  facing blank pages).
 - The threshold is fixed at 60 in the droplet; use the terminal to change it.
 
 ## License
