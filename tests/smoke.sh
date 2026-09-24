@@ -1,5 +1,4 @@
 #!/bin/bash
-# shellcheck disable=SC2034,SC2012,SC2196  # temporary CI diagnostics below
 # Smoke test: a synthetic 3-page noisy "scan" must shrink in both modes and keep its page count.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -28,15 +27,5 @@ magick "$T"/sp?.png -compress none -units PixelsPerInch -density 150 "$T/spread.
 [ "$(pdfinfo "$T/spread.out.pdf" | awk '/^Pages:/ {print $2}')" = 4 ] || { echo "FAIL: split page count" >&2; exit 1; }
 sizes=$(pdfinfo -f 1 -l 4 "$T/spread.out.pdf" | awk '/^Page +[0-9]+ size:/ {print $4, $6}' | sort -u)
 [ "$(echo "$sizes" | awk "END{print NR}")" = 1 ] || { echo "FAIL: pages differ in size: $sizes" >&2; exit 1; }
-h=${sizes#* }; awk -v h="$h" 'BEGIN{exit !(h < 1240*72/150 - 20)}' || {
-  echo "FAIL: border not cropped (height $h)" >&2
-  pdfinfo "$T/spread.pdf" | grep -i 'size' >&2; pdfimages -list "$T/spread.pdf" >&2; magick -version | head -1 >&2
-  pdftoppm -gray -r 300 -f 1 -l 1 -png "$T/spread.pdf" "$T/dbg"; f=$(ls "$T"/dbg*.png | head -1)
-  eval "$(sed -n '/^content_box()/,/^}/p' bitonalpdf.sh)"
-  CROP_MIN_DENSITY=0.03 CROP_MAX_DENSITY=0.55 CROP_EDGE_FRAC=0.015 CROP_PAD_FRAC=0.012
-  echo "content_box: $(content_box "$f" 3508 2480)" >&2
-  magick "$f" \( +clone -blur 0x30 \) -compose Divide_Dst -composite -colorspace Gray -threshold 60% -negate "$T/ink.png"
-  magick identify -verbose "$T/ink.png" | egrep 'Type|Depth|Colorspace|mean' >&2
-  magick "$T/ink.png" -colorspace Gray -scale "1x2480!" -depth 8 gray:- | od -An -v -tu1 | tr -s ' ' '\n' | sort -n | uniq -c | sort -rn | head -5 >&2
-  exit 1; }
+h=${sizes#* }; awk -v h="$h" 'BEGIN{exit !(h < 1240*72/150 - 20)}' || { echo "FAIL: border not cropped (height $h)" >&2; exit 1; }
 echo "smoke ok"
