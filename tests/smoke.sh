@@ -1,17 +1,18 @@
 #!/bin/bash
-# Smoke test: a synthetic 3-page noisy "scan" must shrink in both modes and keep its page count.
+# Smoke test: a synthetic 2-page noisy "scan" must shrink in both modes and keep its page count.
+# Runs at low dpi on purpose: CI is on macOS, where minutes are expensive.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
-for i in 1 2 3; do
-  magick -size 1240x1754 plasma:fractal -colorspace Gray "$T/s$i.png"
+for i in 1 2; do
+  magick -size 620x877 plasma:fractal -colorspace Gray "$T/s$i.png"
 done
-magick "$T"/s?.png -units PixelsPerInch -density 150 "$T/in.pdf"
+magick "$T"/s?.png -units PixelsPerInch -density 75 "$T/in.pdf"
 for mode in text images; do
   rm -f "$T/out.pdf"
-  MODE=$mode ./bitonalpdf.sh "$T/in.pdf" "$T/out.pdf"
+  MODE=$mode ./bitonalpdf.sh "$T/in.pdf" "$T/out.pdf" 60 75
   [ -f "$T/out.pdf" ] || { echo "FAIL: $mode wrote no file" >&2; exit 1; }
-  [ "$(pdfinfo "$T/out.pdf" | awk '/^Pages:/ {print $2}')" = 3 ] || { echo "FAIL: $mode page count" >&2; exit 1; }
+  [ "$(pdfinfo "$T/out.pdf" | awk '/^Pages:/ {print $2}')" = 2 ] || { echo "FAIL: $mode page count" >&2; exit 1; }
 done
 
 # --crop --split: 2 synthetic spreads (speckle blocks standing in for text, either side of a gutter,
@@ -22,7 +23,7 @@ for i in 1 2; do
     "$T/blk.png" -geometry +1054+150 -composite -fill black -draw "rectangle 0,0 1754,30" "$T/sp$i.png"
 done
 magick "$T"/sp?.png -compress none -units PixelsPerInch -density 150 "$T/spread.pdf"  # uncompressed, else the script (rightly) refuses to write a not-smaller file
-./bitonalpdf.sh --crop --split auto "$T/spread.pdf" "$T/spread.out.pdf" >"$T/spread.log" 2>&1 || true
+./bitonalpdf.sh --crop --split auto "$T/spread.pdf" "$T/spread.out.pdf" 60 100 >"$T/spread.log" 2>&1 || true
 [ -f "$T/spread.out.pdf" ] || { cat "$T/spread.log" >&2; echo "FAIL: no spread output" >&2; exit 1; }
 [ "$(pdfinfo "$T/spread.out.pdf" | awk '/^Pages:/ {print $2}')" = 4 ] || { echo "FAIL: split page count" >&2; exit 1; }
 sizes=$(pdfinfo -f 1 -l 4 "$T/spread.out.pdf" | awk '/^Page +[0-9]+ size:/ {print $4, $6}' | sort -u)
