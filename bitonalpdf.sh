@@ -396,7 +396,7 @@ seq 1 "$PAGES" | xargs -P 4 -I{} bash -c 'passB {}'
 
 magick "$TMP"/p*.[tj]* -units PixelsPerInch -density "$DPI" "$OUT"
 
-if [ "$(stat -f %z "$OUT")" -ge "$(stat -f %z "$IN")" ]; then
+if [ "$(wc -c <"$OUT")" -ge "$(wc -c <"$IN")" ]; then
   rm -f "$OUT"
   echo "Not smaller ($(du -h "$IN" | cut -f1) is already small) — no file written"
   exit 0
