@@ -15,12 +15,12 @@ for mode in text images; do
   [ "$(pdfinfo "$T/out.pdf" | awk '/^Pages:/ {print $2}')" = 3 ] || { echo "FAIL: $mode page count" >&2; exit 1; }
 done
 
-# --crop --split: 2 synthetic spreads (text-like line blocks either side of a gutter, plus a dark
-# scanner border along the top) must give 4 pages of one uniform size, with the border cut off.
-draw=()
-for y in $(seq 150 24 1050); do draw+=(-draw "rectangle 150,$y 800,$((y+9))" -draw "rectangle 950,$y 1600,$((y+9))"); done
+# --crop --split: 2 synthetic spreads (speckle blocks standing in for text, either side of a gutter,
+# plus a dark scanner border along the top) must give 4 pages of one uniform size, border cut off.
 for i in 1 2; do
-  magick -size 1754x1240 xc:white -fill black "${draw[@]}" -draw "rectangle 0,0 1754,30" "$T/sp$i.png"
+  magick -seed "$i" -size 110x180 xc: +noise Random -colorspace Gray -threshold 70% -scale 500% "$T/blk.png"
+  magick -size 1754x1240 xc:white "$T/blk.png" -geometry +150+150 -composite \
+    "$T/blk.png" -geometry +1054+150 -composite -fill black -draw "rectangle 0,0 1754,30" "$T/sp$i.png"
 done
 magick "$T"/sp?.png -units PixelsPerInch -density 150 "$T/spread.pdf"
 ./bitonalpdf.sh --crop --split auto "$T/spread.pdf" "$T/spread.out.pdf" >/dev/null 2>&1
