@@ -21,6 +21,6 @@ jobs:
           HOMEBREW_NO_AUTO_UPDATE: 1
           HOMEBREW_NO_INSTALL_CLEANUP: 1
           HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
-      - run: shellcheck -e SC1090,SC2153 bitonalpdf.sh build.sh tests/smoke.sh
+      - run: shellcheck -e SC1090,SC2153 bitonalpdf.sh build.sh tests/smoke.sh tests/real.sh
       - run: tests/smoke.sh
       - run: ./build.sh
