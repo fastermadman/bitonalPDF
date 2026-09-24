@@ -12,7 +12,7 @@
 # Preprocessing options (all opt-in, applied per page before the mode-specific step above,
 # in this order: rotate -> crop -> split -> deskew). See README for details.
 #   --rotate         detect pages lying on their side/upside down (Tesseract OSD) and rotate them
-#   --crop           trim scanner/microfilm borders (single crop box per document, from the median)
+#   --crop           trim scanner/microfilm borders per page, then centre every page on one common canvas size
 #   --split auto|off|N%   cut two-page spreads into separate pages (default: off)
 #                    auto  = detect double pages and their gutter automatically
 #                    N%    = force the gutter at N% of page width for every double-shaped page
@@ -34,7 +34,14 @@ GUTTER_SEARCH_HI=0.80         # ...to this fraction, or it's not trusted (gutter
 GUTTER_MIN_WIDTH_FRAC=0.006   # gutter gap must be at least this wide (fraction of page width)
 GUTTER_MAX_WIDTH_FRAC=0.22    # ...and at most this wide, else it's probably a blank facing page
 GUTTER_MIN_INK_FRAC=0.03      # each half must have at least this fraction of ink-bearing columns
+GUTTER_EDGE_SHAVE=0.03        # top/bottom band (fraction of page height) ignored when profiling columns for the gutter
+GUTTER_MIN_INK_ROWS=2         # a column needs this many dark rows (of GRID_ROWS) to count as ink; one speck doesn't
+GUTTER_TRUST_FRAC=0.08        # a "gutter" wider than this (fraction of page width) is a blank facing page, not a spine
 GRID_ROWS=48                  # rows sampled when building the per-column ink profile
+CROP_MIN_DENSITY=0.03         # a row/column needs at least this ink fraction to count as content...
+CROP_MAX_DENSITY=0.55         # ...and at most this (near-solid rows/columns are scanner borders)
+CROP_EDGE_FRAC=0.015          # ignore the outer band of each edge (fraction of page size)
+CROP_PAD_FRAC=0.012           # margin kept around the detected text block
 
 MODE=${MODE:-text}
 ROTATE=0
@@ -116,15 +123,48 @@ rotate_page() {
 # local background — without this, a dark shadow reads as "ink" and hides the real gutter.
 ink_profile() {
   local w=$1 W=$2 H=$3
+  # Shave the top/bottom edge bands first: a dark scanner border running along an edge would
+  # otherwise make every column count as ink and hide the gutter altogether.
+  local shave; shave=$(awk -v h="$H" -v f="$GUTTER_EDGE_SHAVE" 'BEGIN{printf "%d", h*f}')
   magick "$w" \( +clone -blur 0x30 \) -compose Divide_Dst -composite \
-    -colorspace Gray -resize "${W}x${GRID_ROWS}!" -depth 8 txt:- | awk -v W="$W" -v T="$GUTTER_INK_THRESH" '
+    -colorspace Gray -shave "0x$shave" -resize "${W}x${GRID_ROWS}!" -depth 8 txt:- | awk -v W="$W" -v T="$GUTTER_INK_THRESH" -v R="$GUTTER_MIN_INK_ROWS" '
     /^[0-9]+,[0-9]+:/ {
       split($0, parts, ":"); split(parts[1], xy, ","); x = xy[1] + 0
       gi = index($0, "gray("); s = substr($0, gi + 5); ci = index(s, ")")
       g = substr(s, 1, ci - 1) + 0
-      if (!(x in mn) || g < mn[x]) mn[x] = g
+      if (g < T) dark[x]++
     }
-    END { for (x = 0; x < W; x++) print x, (mn[x] < T) ? 1 : 0 }'
+    END { for (x = 0; x < W; x++) print x, (dark[x] >= R) ? 1 : 0 }'
+}
+
+# text-block bounds of $1 as "w h x y". Plain `-trim` treats a dark scanner border as content and
+# keeps it. Instead: flatten, threshold to an ink map, and take per-row/column ink density. Rows and
+# columns that are near-solid (border stripes) or nearly empty (specks) don't count, and the outer
+# CROP_EDGE_FRAC band is ignored, so borders that vary from page to page are cut per page.
+content_box() {
+  local w=$1 W=$2 H=$3
+  local ink="$w.ink.png"
+  magick "$w" \( +clone -blur 0x30 \) -compose Divide_Dst -composite \
+    -colorspace Gray -threshold 60% -negate "$ink" || return 1
+  local prof
+  for axis in cols rows; do
+    if [ "$axis" = cols ]; then prof=$(magick "$ink" -scale "${W}x1!" -depth 8 txt:-)
+    else prof=$(magick "$ink" -scale "1x${H}!" -depth 8 txt:-); fi
+    printf '%s\n' "$prof" | awk -v axis="$axis" -v N="$([ "$axis" = cols ] && echo "$W" || echo "$H")" \
+      -v lo="$CROP_MIN_DENSITY" -v hi="$CROP_MAX_DENSITY" -v edge="$CROP_EDGE_FRAC" -v pad="$CROP_PAD_FRAC" '
+      /^[0-9]+,[0-9]+:/ {
+        split($0, a, ":"); split(a[1], xy, ","); i = (axis == "cols") ? xy[1] : xy[2]
+        gi = index($0, "gray("); s = substr($0, gi + 5); g = substr(s, 1, index(s, ")") - 1) + 0
+        d = g / 255; if (d >= lo && d <= hi) { if (first == "" || i < first) { if (i >= edge * N) first = i }
+                                                if (i <= N - 1 - edge * N && i > last) last = i } }
+      END {
+        if (first == "") { first = 0; last = N - 1 }
+        first = int(first - pad * N); last = int(last + pad * N)
+        if (first < 0) first = 0; if (last > N - 1) last = N - 1
+        print first, last - first + 1 }' > "$w.$axis"
+  done
+  read -r x0 wd < "$w.cols"; read -r y0 ht < "$w.rows"; rm -f "$w.cols" "$w.rows" "$ink"
+  echo "$wd $ht $x0 $y0"
 }
 
 measure_geometry() {
@@ -132,7 +172,7 @@ measure_geometry() {
   local w="$TMP/w$p.png" meta="$TMP/meta/$p.txt"
   local W H tx ty tw th
   read -r W H < <(magick identify -format '%w %h' "$w")
-  read -r tw th tx ty < <(magick "$w" -fuzz 5% -trim -format '%w %h %X %Y' info: 2>/dev/null) || { tw=$W; th=$H; tx=0; ty=0; }
+  read -r tw th tx ty < <(content_box "$w" "$W" "$H") || { tw=$W; th=$H; tx=0; ty=0; }
   tx=$((tx)); ty=$((ty))
   local ar; ar=$(awk -v w="$W" -v h="$H" 'BEGIN{printf "%.4f", w/h}')
   local ar_candidate; ar_candidate=$(awk -v ar="$ar" -v m="$DOUBLE_AR_MIN" 'BEGIN{print (ar>=m)?1:0}')
@@ -200,10 +240,11 @@ passA() {
     measure_geometry "$n"
   fi
 }
-export -f render rotate_page ink_profile measure_geometry passA
+export -f render rotate_page ink_profile content_box measure_geometry passA
 export IN TMP MODE DPI ROTATE CROP SPLIT_MODE SPLIT_FIXED
 export OSD_MIN_CONFIDENCE DOUBLE_AR_MIN GUTTER_INK_THRESH GUTTER_SEARCH_LO GUTTER_SEARCH_HI
 export GUTTER_MIN_WIDTH_FRAC GUTTER_MAX_WIDTH_FRAC GUTTER_MIN_INK_FRAC GRID_ROWS
+export GUTTER_EDGE_SHAVE GUTTER_MIN_INK_ROWS GUTTER_TRUST_FRAC CROP_MIN_DENSITY CROP_MAX_DENSITY CROP_EDGE_FRAC CROP_PAD_FRAC
 
 echo "Pass 1/2: rendering + measuring $PAGES pages (4 at a time, MODE=$MODE)..."
 seq 1 "$PAGES" | xargs -P 4 -I{} bash -c 'passA {}'
@@ -228,12 +269,15 @@ if [ "$CROP" = 1 ]; then
                           SINGLE_X1=$(median < "$TMP/.x1"); SINGLE_Y1=$(median < "$TMP/.y1"); }
 fi
 
+# 1 if this page's detected gutter is too wide to be a spine (needs GUTTER_W/W from a sourced meta file)
+gutter_wide() { awk -v gw="$GUTTER_W" -v w="$W" -v t="$GUTTER_TRUST_FRAC" 'BEGIN{print (gw > t*w) ? 1 : 0}'; }
+
 if [ "$SPLIT_MODE" = auto ]; then
   for n in $(seq 1 "$PAGES"); do
     p=$(printf %04d "$n"); m="$TMP/meta/$p.txt"
     [ -f "$m" ] || continue
     ( . "$m"
-      if [ "$AR_CANDIDATE" = 1 ] && [ "$GUTTER_FOUND" = 1 ]; then
+      if [ "$AR_CANDIDATE" = 1 ] && [ "$GUTTER_FOUND" = 1 ] && [ "$(gutter_wide)" = 0 ]; then
         awk -v x="$GUTTER_X" -v w="$W" 'BEGIN{printf "%.4f\n", x/w}' >> "$TMP/.gfrac"
       fi )
   done
@@ -251,7 +295,7 @@ compute_plan() {
       out_split=0; out_x0=""; out_y0=""; out_x1=""; out_y1=""; out_gx=""
       if [ "$SPLIT_MODE" != off ] && [ "$AR_CANDIDATE" = 1 ]; then
         gx=""
-        if [ "$GUTTER_FOUND" = 1 ]; then
+        if [ "$GUTTER_FOUND" = 1 ] && { [ -z "$DOUBLE_GFRAC" ] || [ "$(gutter_wide)" = 0 ]; }; then
           gx=$GUTTER_X
         elif [ "$SPLIT_MODE" = auto ] && [ -n "$DOUBLE_GFRAC" ]; then
           gx=$(awk -v f="$DOUBLE_GFRAC" -v w="$W" 'BEGIN{printf "%d", f*w}')
@@ -259,10 +303,12 @@ compute_plan() {
         if [ -n "$gx" ]; then
           # crop to the real content bounds (never loses text) and split at the actual
           # detected gutter, rather than forcing a symmetric box and cutting it at 50%
-          [ "$gx" -lt "$TRIM_X" ] && gx=$TRIM_X
-          [ "$gx" -gt "$((TRIM_X+TRIM_W))" ] && gx=$((TRIM_X+TRIM_W))
           out_split=1
           out_x0=$TRIM_X; out_x1=$((TRIM_X+TRIM_W)); out_y0=$TRIM_Y; out_y1=$((TRIM_Y+TRIM_H)); out_gx=$gx
+          # a blank facing page has no content, so the box can start/end on the far side of the
+          # gutter: mirror the other half's width instead of collapsing the blank page to nothing
+          if [ "$out_x0" -ge "$gx" ]; then out_x0=$((gx-(out_x1-gx))); [ "$out_x0" -lt 0 ] && out_x0=0; fi
+          if [ "$out_x1" -le "$gx" ]; then out_x1=$((gx+(gx-out_x0))); [ "$out_x1" -gt "$W" ] && out_x1=$W; fi
         else
           echo "$n" >> "$REVIEW_FILE"
         fi
@@ -278,6 +324,22 @@ compute_plan() {
   fi
 }
 for n in $(seq 1 "$PAGES"); do compute_plan "$n"; done
+
+# one output size for the whole document: the largest text box (never clips text). Every page is
+# centred on a white canvas of that size in pass B, so a book doesn't jump around when read.
+TW=0; TH=0
+if [ "$CROP" = 1 ] || [ "$SPLIT_MODE" != off ]; then
+  read -r TW TH < <(awk -F= '
+    $1=="SPLIT" { s=$2; x0=y0=x1=y1=gx="" }
+    $1=="X0" { x0=$2 } $1=="Y0" { y0=$2 } $1=="X1" { x1=$2 } $1=="Y1" { y1=$2 }
+    $1=="GX" { gx=$2
+      if (x0 != "") {
+        if (y1-y0 > th) th = y1-y0
+        if (s == 1) { if (gx-x0 > tw) tw = gx-x0; if (x1-gx > tw) tw = x1-gx }
+        else if (x1-x0 > tw) tw = x1-x0
+      } }
+    END { print tw+0, th+0 }' "$TMP"/plan/*.txt)
+fi
 
 # ---------- pass B: crop/split/deskew + mode-specific finishing (parallel, per page) ----------
 finish_slot() {
@@ -307,6 +369,10 @@ passB() {
       magick "$lw" -background white -deskew 40% +repage "$lw"
       magick "$rw" -background white -deskew 40% +repage "$rw"
     fi
+    if [ "$TW" -gt 0 ]; then
+      magick "$lw" -background white -gravity center -extent "${TW}x${TH}" +repage "$lw"
+      magick "$rw" -background white -gravity center -extent "${TW}x${TH}" +repage "$rw"
+    fi
     finish_slot "$lw" "$TMP/p${p}a"
     finish_slot "$rw" "$TMP/p${p}b"
   else
@@ -316,12 +382,15 @@ passB() {
       magick "$w" -crop "$((X1-X0))x$((Y1-Y0))+${X0}+${Y0}" +repage "$sw"
     fi
     [ "$DESKEW" = 1 ] && magick "$sw" -background white -deskew 40% +repage "$sw"
+    if [ "$TW" -gt 0 ] && [ -n "$X0" ]; then
+      magick "$sw" -background white -gravity center -extent "${TW}x${TH}" +repage "$sw"
+    fi
     finish_slot "$sw" "$TMP/p${p}a"
   fi
   echo "$n" >> "$PROGRESS_FILE"
 }
 export -f finish_slot passB
-export THRESH PROGRESS_FILE DESKEW
+export THRESH PROGRESS_FILE DESKEW TW TH
 
 echo "Pass 2/2: cropping/splitting/deskewing + MODE=$MODE finishing..."
 seq 1 "$PAGES" | xargs -P 4 -I{} bash -c 'passB {}'

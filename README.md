@@ -59,7 +59,7 @@ downstream (OCR, text extraction). These are opt-in flags, applied per page in t
 | Flag | What it does |
 |---|---|
 | `--rotate` | Detects pages lying on their side or upside down (Tesseract OSD) and rotates them upright. Needs `tesseract`; skipped with a warning if it's not installed, or if a page has too little text to read its orientation. |
-| `--crop` | Trims scanner/microfilm borders. Uses one crop box for the whole document (the median across pages), so pages come out a uniform size. |
+| `--crop` | Trims scanner/microfilm borders. Trims each page to its text block (dark scanner borders are ignored), then centres every page on a canvas the size of the largest text block, so all pages come out the same size. |
 | `--split auto\|off\|N%` | Cuts two-page spreads into separate pages. `auto` detects double pages and the gutter (spine) position per page, using the document-wide median as a fallback for pages it isn't sure about. `N%` (e.g. `--split 52%`) skips detection and forces the gutter at that position on every double-shaped page — use it when `auto` gets a document wrong. Default `off`. |
 | `--deskew` | Straightens each resulting page (small-angle rotation), after splitting. |
 
