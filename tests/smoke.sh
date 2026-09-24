@@ -1,4 +1,5 @@
 #!/bin/bash
+# shellcheck disable=SC2034,SC2012,SC2196  # temporary CI diagnostics below
 # Smoke test: a synthetic 3-page noisy "scan" must shrink in both modes and keep its page count.
 set -euo pipefail
 cd "$(dirname "$0")/.."
