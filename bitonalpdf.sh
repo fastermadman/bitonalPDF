@@ -148,15 +148,14 @@ content_box() {
     -colorspace Gray -threshold 60% -negate "$ink" || return 1
   local prof
   for axis in cols rows; do
-    if [ "$axis" = cols ]; then prof=$(magick "$ink" -scale "${W}x1!" -depth 8 txt:-)
-    else prof=$(magick "$ink" -scale "1x${H}!" -depth 8 txt:-); fi
-    printf '%s\n' "$prof" | awk -v axis="$axis" -v N="$([ "$axis" = cols ] && echo "$W" || echo "$H")" \
+    # raw 8-bit gray bytes, one per column/row (the txt: format differs between ImageMagick versions)
+    if [ "$axis" = cols ]; then prof=$(magick "$ink" -colorspace Gray -scale "${W}x1!" -depth 8 gray:- | od -An -v -tu1)
+    else prof=$(magick "$ink" -colorspace Gray -scale "1x${H}!" -depth 8 gray:- | od -An -v -tu1); fi
+    printf '%s\n' "$prof" | awk -v N="$([ "$axis" = cols ] && echo "$W" || echo "$H")" \
       -v lo="$CROP_MIN_DENSITY" -v hi="$CROP_MAX_DENSITY" -v edge="$CROP_EDGE_FRAC" -v pad="$CROP_PAD_FRAC" '
-      /^[0-9]+,[0-9]+:/ {
-        split($0, a, ":"); split(a[1], xy, ","); i = (axis == "cols") ? xy[1] : xy[2]
-        gi = index($0, "gray("); s = substr($0, gi + 5); g = substr(s, 1, index(s, ")") - 1) + 0
-        d = g / 255; if (d >= lo && d <= hi) { if (first == "" || i < first) { if (i >= edge * N) first = i }
-                                                if (i <= N - 1 - edge * N && i > last) last = i } }
+      { for (k = 1; k <= NF; k++) { i = n++; d = $k / 255
+          if (d >= lo && d <= hi) { if (first == "" && i >= edge * N) first = i
+                                    if (i <= N - 1 - edge * N && i > last) last = i } } }
       END {
         if (first == "") { first = 0; last = N - 1 }
         first = int(first - pad * N); last = int(last + pad * N)
