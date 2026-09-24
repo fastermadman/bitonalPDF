@@ -1,11 +1,15 @@
 name: CI
 
 # macOS runner: the script uses BSD `stat` and build.sh needs osacompile/codesign.
-# Public repo, so macOS minutes are free.
+# macOS minutes are the expensive ones, so: run on PRs only (merging a PR doesn't re-run the same
+# tree on main), cancel superseded runs, and keep the smoke test small (tests/smoke.sh).
 on:
   pull_request:
-  push:
-    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   check:
@@ -13,6 +17,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: brew install poppler imagemagick shellcheck tesseract
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+          HOMEBREW_NO_INSTALL_CLEANUP: 1
+          HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
       - run: shellcheck -e SC1090,SC2153 bitonalpdf.sh build.sh tests/smoke.sh
       - run: tests/smoke.sh
       - run: ./build.sh

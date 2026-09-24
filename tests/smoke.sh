@@ -1,17 +1,18 @@
 #!/bin/bash
-# Smoke test: a synthetic 3-page noisy "scan" must shrink in both modes and keep its page count.
+# Smoke test: a synthetic 2-page noisy "scan" must shrink in both modes and keep its page count.
+# Runs at low dpi on purpose: CI is on macOS, where minutes are expensive.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
-for i in 1 2 3; do
-  magick -size 1240x1754 plasma:fractal -colorspace Gray "$T/s$i.png"
+for i in 1 2; do
+  magick -size 620x877 plasma:fractal -colorspace Gray "$T/s$i.png"
 done
-magick "$T"/s?.png -units PixelsPerInch -density 150 "$T/in.pdf"
+magick "$T"/s?.png -units PixelsPerInch -density 75 "$T/in.pdf"
 for mode in text images; do
   rm -f "$T/out.pdf"
-  MODE=$mode ./bitonalpdf.sh "$T/in.pdf" "$T/out.pdf"
+  MODE=$mode ./bitonalpdf.sh "$T/in.pdf" "$T/out.pdf" 60 75
   [ -f "$T/out.pdf" ] || { echo "FAIL: $mode wrote no file" >&2; exit 1; }
-  [ "$(pdfinfo "$T/out.pdf" | awk '/^Pages:/ {print $2}')" = 3 ] || { echo "FAIL: $mode page count" >&2; exit 1; }
+  [ "$(pdfinfo "$T/out.pdf" | awk '/^Pages:/ {print $2}')" = 2 ] || { echo "FAIL: $mode page count" >&2; exit 1; }
 done
 
 # --crop --split: 2 synthetic spreads (speckle blocks standing in for text, either side of a gutter,
