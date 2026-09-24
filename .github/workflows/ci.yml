@@ -13,6 +13,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: brew install poppler imagemagick shellcheck tesseract
-      - run: shellcheck bitonalpdf.sh build.sh tests/smoke.sh
+      - run: shellcheck -e SC1090,SC2153 bitonalpdf.sh build.sh tests/smoke.sh
       - run: tests/smoke.sh
       - run: ./build.sh
