@@ -4,7 +4,7 @@
 # the page count in tests/real/<name>.pages. Output goes to tests/real/out/ for eyeballing.
 # Usage: tests/real.sh [--rotate --crop --split auto --deskew]   (default: all four)
 set -uo pipefail
-cd "$(dirname "$0")/real"
+cd "$(dirname "$0")/real" || exit 1
 FLAGS=("$@"); [ ${#FLAGS[@]} -gt 0 ] || FLAGS=(--rotate --crop --split auto --deskew)
 mkdir -p out; fail=0; found=0
 for f in *.pdf; do
