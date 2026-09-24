@@ -96,3 +96,9 @@ macOS 26 puts legacy `.icns` icons in a grey plate. The icon is therefore an Ico
 (`assets/AppIcon.icon`) compiled to `assets/compiled/Assets.car`. The compile needs Xcode's `actool`, so
 it runs in the manual **compile-icon** GitHub workflow (Actions → compile-icon → Run workflow); download
 the artifact into `assets/compiled/` and run `./build.sh`.
+
+## Testing
+
+`tests/smoke.sh` runs on synthetic pages (this is what CI runs). To try real scans that must not be committed
+(copyright), put PDFs in `tests/real/` (git-ignored) and run `tests/real.sh`; it checks page sizes and
+optional page counts (`tests/real/<name>.pages`) and writes results to `tests/real/out/`.
