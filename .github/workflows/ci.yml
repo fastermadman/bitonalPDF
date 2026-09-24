@@ -1,8 +1,8 @@
 name: CI
 
-# macOS runner: the script uses BSD `stat` and build.sh needs osacompile/codesign.
-# macOS minutes are the expensive ones, so: run on PRs only (merging a PR doesn't re-run the same
-# tree on main), cancel superseded runs, and keep the smoke test small (tests/smoke.sh).
+# Lint + smoke test run on ubuntu (cheap); macOS minutes cost 10x, so macOS only builds the app
+# (needs osacompile/codesign/plutil). PR-only, and superseded runs are cancelled.
+# `check` is the required status check in the pr-flow ruleset.
 on:
   pull_request:
   workflow_dispatch:
@@ -13,14 +13,22 @@ concurrency:
 
 jobs:
   check:
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: brew install poppler imagemagick shellcheck tesseract
+      - run: sudo apt-get update && sudo apt-get install -y poppler-utils tesseract-ocr shellcheck
+      # apt's ImageMagick is v6 (no `magick` command); Homebrew is preinstalled on the runner.
+      - run: |
+          brew install imagemagick
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
         env:
           HOMEBREW_NO_AUTO_UPDATE: 1
           HOMEBREW_NO_INSTALL_CLEANUP: 1
-          HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
       - run: shellcheck -e SC1090,SC2153 bitonalpdf.sh build.sh tests/smoke.sh tests/real.sh
       - run: tests/smoke.sh
+
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
       - run: ./build.sh
