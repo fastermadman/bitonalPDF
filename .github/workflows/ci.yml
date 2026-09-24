@@ -17,10 +17,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y poppler-utils tesseract-ocr shellcheck
-      # apt's ImageMagick is v6 (no `magick` command); Homebrew is preinstalled on the runner.
+      # apt's ImageMagick is v6 (no `magick` command); Homebrew is preinstalled but not on PATH.
       - run: |
-          brew install imagemagick
-          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+          /home/linuxbrew/.linuxbrew/bin/brew install imagemagick
+          echo /home/linuxbrew/.linuxbrew/bin >> "$GITHUB_PATH"
         env:
           HOMEBREW_NO_AUTO_UPDATE: 1
           HOMEBREW_NO_INSTALL_CLEANUP: 1
