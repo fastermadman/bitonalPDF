@@ -249,7 +249,7 @@ echo "Pass 1/2: rendering + measuring $PAGES pages (4 at a time, MODE=$MODE)..."
 seq 1 "$PAGES" | xargs -P 4 -I{} bash -c 'passA {}'
 
 # ---------- between passes: document-level medians (sequential, cheap) ----------
-median() { sort -n | awk '{a[NR]=$1; n=NR} END{if(n==0){print ""; exit} if(n%2)print a[(n+1)/2]; else print (a[int(n/2)]+a[int(n/2)+1])/2}'; }
+median() { sort -n | awk '{a[NR]=$1; n=NR} END{if(n==0){print ""; exit} if(n%2)print a[(n+1)/2]; else print int((a[int(n/2)]+a[int(n/2)+1])/2)}'; }
 
 SINGLE_X0=""; SINGLE_Y0=""; SINGLE_X1=""; SINGLE_Y1=""
 DOUBLE_GFRAC=""

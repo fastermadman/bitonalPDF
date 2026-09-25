@@ -14,6 +14,8 @@ for f in *.pdf; do
   ../../bitonalpdf.sh "${FLAGS[@]}" "$f" "$o" >"out/$name.log" 2>&1; rc=$?
   secs=$(( $(date +%s) - start ))
   # rc 2 = pages flagged for manual check; anything else non-zero is a failure
+  # "Not smaller" = the input was already small; correct for a clean PDF, so it counts as a pass
+  if grep -q "^Not smaller" "out/$name.log"; then echo "$name: ok (not smaller — no file written)"; continue; fi
   if [ $rc -ne 0 ] && [ $rc -ne 2 ]; then echo "FAIL $name: exit $rc (see out/$name.log)"; fail=1; continue; fi
   [ -f "$o" ] || { echo "FAIL $name: no output written (see out/$name.log)"; fail=1; continue; }
   pin=$(pdfinfo "$f" | awk '/^Pages:/ {print $2}'); pout=$(pdfinfo "$o" | awk '/^Pages:/ {print $2}')
