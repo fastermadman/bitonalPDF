@@ -37,6 +37,7 @@ GUTTER_MIN_INK_FRAC=0.03      # each half must have at least this fraction of in
 GUTTER_EDGE_SHAVE=0.03        # top/bottom band (fraction of page height) ignored when profiling columns for the gutter
 GUTTER_MIN_INK_ROWS=2         # a column needs this many dark rows (of GRID_ROWS) to count as ink; one speck doesn't
 GUTTER_TRUST_FRAC=0.08        # a "gutter" wider than this (fraction of page width) is a blank facing page, not a spine
+GUTTER_VALLEY_RATIO=0.5       # fallback when no ink-free gap exists (text touches the spine): accept the deepest ink-density dip if it is below this fraction of the density on both sides
 GRID_ROWS=48                  # rows sampled when building the per-column ink profile
 CROP_MIN_DENSITY=0.03         # a row/column needs at least this ink fraction to count as content...
 CROP_MAX_DENSITY=0.55         # ...and at most this (near-solid rows/columns are scanner borders)
@@ -134,7 +135,7 @@ ink_profile() {
       g = substr(s, 1, ci - 1) + 0
       if (g < T) dark[x]++
     }
-    END { for (x = 0; x < W; x++) print x, (dark[x] >= R) ? 1 : 0 }'
+    END { for (x = 0; x < W; x++) print x, (dark[x] >= R) ? 1 : 0, dark[x] + 0 }'
 }
 
 # text-block bounds of $1 as "w h x y". Plain `-trim` treats a dark scanner border as content and
@@ -185,8 +186,26 @@ measure_geometry() {
       local profile; profile=$(ink_profile "$w" "$W" "$H")
       read -r gutter_found gutter_x gutter_w < <(printf '%s\n' "$profile" | awk -v W="$W" \
         -v lo="$GUTTER_SEARCH_LO" -v hi="$GUTTER_SEARCH_HI" \
-        -v minwf="$GUTTER_MIN_WIDTH_FRAC" -v maxwf="$GUTTER_MAX_WIDTH_FRAC" -v minink="$GUTTER_MIN_INK_FRAC" '
-        { ink[$1] = $2 }
+        -v minwf="$GUTTER_MIN_WIDTH_FRAC" -v maxwf="$GUTTER_MAX_WIDTH_FRAC" -v minink="$GUTTER_MIN_INK_FRAC" -v vr="$GUTTER_VALLEY_RATIO" '
+        { ink[$1] = $2; cnt[$1] = $3 }
+        # no ink-free gap (text touches the spine, or skew keeps every column faintly inked): take the
+        # deepest dip of a smoothed ink-density profile inside the search window, if it is clearly
+        # below the density on both sides. Prints "found x".
+        function valley(   sw, x, k, sm, n, best, bx, lb, rb, ln, rn, a1, a2) {
+          sw = int(W * 0.003); if (sw < 1) sw = 1
+          for (x = 0; x < W; x++) { n = 0; sm[x] = 0
+            for (k = x - sw; k <= x + sw; k++) if (k >= 0 && k < W) { sm[x] += cnt[k]; n++ }
+            sm[x] /= n }
+          best = 1e9; bx = -1
+          for (x = int(W * lo); x <= int(W * hi); x++) if (sm[x] < best) { best = sm[x]; bx = x }
+          if (bx < 0) return "0 0"
+          a1 = int(W * 0.03); a2 = int(W * 0.15)
+          for (k = bx - a2; k <= bx - a1; k++) if (k >= 0) { lb += sm[k]; ln++ }
+          for (k = bx + a1; k <= bx + a2; k++) if (k < W) { rb += sm[k]; rn++ }
+          if (ln == 0 || rn == 0) return "0 0"
+          lb /= ln; rb /= rn
+          return (best <= vr * lb && best <= vr * rb && lb > 0 && rb > 0) ? ("1 " bx) : "0 0"
+        }
         END {
           # widest run of non-ink columns whose midpoint falls in the centre search window —
           # more robust than "nearest ink from the centre" against a single noisy pixel
@@ -204,7 +223,7 @@ measure_geometry() {
             }
           }
           if (bests < 0) {
-            print 0, 0, 0
+            print valley(), 0
           } else {
             gx = int((bests + beste) / 2)
             gw = beste - bests
@@ -217,7 +236,7 @@ measure_geometry() {
             gfrac = gx / W
             gwfrac = gw / W
             ok = (gfrac >= lo && gfrac <= hi && gwfrac >= minwf && gwfrac <= maxwf && lifrac >= minink && rifrac >= minink)
-            print (ok ? 1 : 0), gx, gw
+            if (ok) print 1, gx, gw; else print valley(), 0
           }
         }')
     fi
@@ -243,7 +262,7 @@ export -f render rotate_page ink_profile content_box measure_geometry passA
 export IN TMP MODE DPI ROTATE CROP SPLIT_MODE SPLIT_FIXED
 export OSD_MIN_CONFIDENCE DOUBLE_AR_MIN GUTTER_INK_THRESH GUTTER_SEARCH_LO GUTTER_SEARCH_HI
 export GUTTER_MIN_WIDTH_FRAC GUTTER_MAX_WIDTH_FRAC GUTTER_MIN_INK_FRAC GRID_ROWS
-export GUTTER_EDGE_SHAVE GUTTER_MIN_INK_ROWS GUTTER_TRUST_FRAC CROP_MIN_DENSITY CROP_MAX_DENSITY CROP_EDGE_FRAC CROP_PAD_FRAC
+export GUTTER_VALLEY_RATIO GUTTER_EDGE_SHAVE GUTTER_MIN_INK_ROWS GUTTER_TRUST_FRAC CROP_MIN_DENSITY CROP_MAX_DENSITY CROP_EDGE_FRAC CROP_PAD_FRAC
 
 echo "Pass 1/2: rendering + measuring $PAGES pages (4 at a time, MODE=$MODE)..."
 seq 1 "$PAGES" | xargs -P 4 -I{} bash -c 'passA {}'
