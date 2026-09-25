@@ -29,4 +29,11 @@ magick "$T"/sp?.png -compress none -units PixelsPerInch -density 150 "$T/spread.
 sizes=$(pdfinfo -f 1 -l 4 "$T/spread.out.pdf" | awk '/^Page +[0-9]+ size:/ {print $4, $6}' | sort -u)
 [ "$(echo "$sizes" | awk "END{print NR}")" = 1 ] || { echo "FAIL: pages differ in size: $sizes" >&2; exit 1; }
 h=${sizes#* }; awk -v h="$h" 'BEGIN{exit !(h < 1240*72/150 - 20)}' || { echo "FAIL: border not cropped (height $h)" >&2; exit 1; }
+# --crop must keep a sparse line (page number) just below the text block: strokes at y=1150..1185 must survive (block alone would crop to ~940px).
+magick -size 1240x1754 xc:white "$T/blk.png" -geometry +150+150 -composite -fill black -draw "rectangle 600,1150 606,1185" -draw "rectangle 620,1150 626,1185" -draw "rectangle 640,1150 646,1185" "$T/pn.png"
+magick "$T/pn.png" -compress none -units PixelsPerInch -density 150 "$T/pn.pdf"
+./bitonalpdf.sh --crop "$T/pn.pdf" "$T/pn.out.pdf" >"$T/pn.log" 2>&1 || true
+[ -f "$T/pn.out.pdf" ] || { cat "$T/pn.log" >&2; echo "FAIL: no page-number output" >&2; exit 1; }
+h=$(pdfinfo "$T/pn.out.pdf" | awk '/^Page +size:/ {print $5}')
+awk -v h="$h" 'BEGIN{exit !(h*150/72 >= 1050)}' || { echo "FAIL: page number cropped off (height $h pt)" >&2; exit 1; }
 echo "smoke ok"

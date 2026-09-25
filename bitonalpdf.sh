@@ -41,6 +41,8 @@ GUTTER_VALLEY_RATIO=0.5       # fallback when no ink-free gap exists (text touch
 GRID_ROWS=48                  # rows sampled when building the per-column ink profile
 CROP_MIN_DENSITY=0.03         # a row/column needs at least this ink fraction to count as content...
 CROP_MAX_DENSITY=0.55         # ...and at most this (near-solid rows/columns are scanner borders)
+CROP_NEAR_DENSITY=0.004       # sparse ink (page numbers, running heads) this close to the text block is kept: weaker than MIN_DENSITY, but only within CROP_NEAR_FRAC
+CROP_NEAR_FRAC=0.08           # how far (fraction of page size) beyond the text block sparse ink is searched for
 CROP_EDGE_FRAC=0.015          # ignore the outer band of each edge (fraction of page size)
 CROP_PAD_FRAC=0.012           # margin kept around the detected text block
 
@@ -153,12 +155,17 @@ content_box() {
     if [ "$axis" = cols ]; then prof=$(magick "$ink" -colorspace Gray -scale "${W}x1!" -depth 8 gray:- | od -An -v -tu1)
     else prof=$(magick "$ink" -colorspace Gray -scale "1x${H}!" -depth 8 gray:- | od -An -v -tu1); fi
     printf '%s\n' "$prof" | awk -v N="$([ "$axis" = cols ] && echo "$W" || echo "$H")" \
-      -v lo="$CROP_MIN_DENSITY" -v hi="$CROP_MAX_DENSITY" -v edge="$CROP_EDGE_FRAC" -v pad="$CROP_PAD_FRAC" '
-      { for (k = 1; k <= NF; k++) { i = n++; d = $k / 255
+      -v lo="$CROP_MIN_DENSITY" -v hi="$CROP_MAX_DENSITY" -v edge="$CROP_EDGE_FRAC" -v pad="$CROP_PAD_FRAC" -v nlo="$CROP_NEAR_DENSITY" -v near="$CROP_NEAR_FRAC" '
+      { for (k = 1; k <= NF; k++) { i = n++; d = $k / 255; dens[i] = d
           if (d >= lo && d <= hi) { if (first == "" && i >= edge * N) first = i
                                     if (i <= N - 1 - edge * N && i > last) last = i } } }
       END {
         if (first == "") { first = 0; last = N - 1 }
+        else {  # extend to sparse ink near the block; the speck filter still decides where the block is
+          f0 = first; l0 = last
+          for (i = f0 - 1; i >= f0 - near * N && i >= edge * N; i--) if (dens[i] >= nlo && dens[i] <= hi) first = i
+          for (i = l0 + 1; i <= l0 + near * N && i <= N - 1 - edge * N; i++) if (dens[i] >= nlo && dens[i] <= hi) last = i
+        }
         first = int(first - pad * N); last = int(last + pad * N)
         if (first < 0) first = 0; if (last > N - 1) last = N - 1
         print first, last - first + 1 }' > "$w.$axis"
@@ -262,7 +269,7 @@ export -f render rotate_page ink_profile content_box measure_geometry passA
 export IN TMP MODE DPI ROTATE CROP SPLIT_MODE SPLIT_FIXED
 export OSD_MIN_CONFIDENCE DOUBLE_AR_MIN GUTTER_INK_THRESH GUTTER_SEARCH_LO GUTTER_SEARCH_HI
 export GUTTER_MIN_WIDTH_FRAC GUTTER_MAX_WIDTH_FRAC GUTTER_MIN_INK_FRAC GRID_ROWS
-export GUTTER_VALLEY_RATIO GUTTER_EDGE_SHAVE GUTTER_MIN_INK_ROWS GUTTER_TRUST_FRAC CROP_MIN_DENSITY CROP_MAX_DENSITY CROP_EDGE_FRAC CROP_PAD_FRAC
+export GUTTER_VALLEY_RATIO GUTTER_EDGE_SHAVE GUTTER_MIN_INK_ROWS GUTTER_TRUST_FRAC CROP_MIN_DENSITY CROP_NEAR_DENSITY CROP_NEAR_FRAC CROP_MAX_DENSITY CROP_EDGE_FRAC CROP_PAD_FRAC
 
 echo "Pass 1/2: rendering + measuring $PAGES pages (4 at a time, MODE=$MODE)..."
 seq 1 "$PAGES" | xargs -P 4 -I{} bash -c 'passA {}'
