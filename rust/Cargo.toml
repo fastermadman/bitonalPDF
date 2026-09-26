@@ -1,0 +1,10 @@
+[package]
+name = "bitonalpdf"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+fax = "0.3.0"
+hayro = "0.7.1"
+kurbo = "0.13.1"
+pdf-writer = "0.15.0"
