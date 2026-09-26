@@ -6,7 +6,7 @@
 # Rows: PASS / FAIL / KNOWN-FAIL (an open defect that still fails: reported, exit 0) / XPASS (a known
 # defect that now passes: exit 1, move it out of the KNOWN list). Exit 1 on any FAIL or XPASS.
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 BIN=${BIN:-./bitonalpdf.sh}
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 MEASURE=tests/measure.sh
