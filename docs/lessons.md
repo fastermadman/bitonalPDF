@@ -132,6 +132,19 @@ Pitfalls found: the pre-fix `7fa02c2` on ImageMagick -31 also "passes" `stripe`/
 flatten is broken (blank page), so read a pre-fix row only for the case it is meant to prove; `-format '%w %h'`
 without `\n` makes `read` fail under `set -e`; `magick … -format %@` warns on an all-white page.
 
+### 8. Porting the crop/gutter rules to Rust (#29)
+Details and numbers: `docs/rust-port.md` section 2. What generalises:
+- The rules have **cliffs**: densities come in 1/255 steps and are compared with 0.004 and 0.03, plus the 8 % near-window,
+  the 10 % band zone and "widest ink-free run". A blur that is 1–9 % off at a dark edge, or another renderer's
+  anti-aliasing, tips them: 70–90 px crop edges, a lost page number, a gutter 100+ px away. A re-implementation must
+  match the Gaussian closely *including the edge semantics* (repeat the edge pixel), not only on average.
+- The bash `median()` truncates the gutter fraction to 0 for an even count, so `skewed` was output at the spread width
+  (#40). `skewed.facts` recorded it; nobody noticed because every page was still "ok" and looked centred.
+- Analysis at 150/100 dpi breaks the rules above (page numbers lost on `ryg-side`) and buys nothing once the blur is fast.
+- A dithered 1-bit page must be smoothed when it is resampled (as poppler does), but only for the output image: measured on
+  the smoothed copy, `sidste` p4 lost its page numbers to the band rule.
+- Deskew first does not work for books: on `skewed` 11 of 23 spreads have halves skewed > 0.5° apart, mostly opposite.
+
 ## Things that did not work or were misleading
 
 - `real.sh` says "ok" while the output is wrong. It only checks that a file is written, all pages have
@@ -148,7 +161,7 @@ without `\n` makes `read` fail under `set -e`; `magick … -format %@` warns on 
   bitmaps are identical. Compare `pdfimages` output instead (#28).
 - A 1-bit (CCITT) scan page that is a few px off the target size looks different after poppler's downsampling
   (dither smeared to grey) than when mapped 1:1 (dither kept). Same text, +28 % G4 size on the two such pages
-  in `sidste side …` (docs/rust-port.md, #28).
+  in `sidste side …` (docs/rust-port.md, #28). Solved in #29 (see 8).
 - `pdfinfo` `Page size: W x H pts`: awk fields are `$3` = width, `$5` = height (twice wrong in smoke tests).
 - A regression test must be shown to **fail without the fix**; two of ours passed vacuously first.
 - Don't run `real.sh` and `smoke.sh` at once, and don't `git stash` the script while a run uses it.
@@ -184,6 +197,7 @@ without `\n` makes `read` fail under `set -e`; `magick … -format %@` warns on 
    (relevant for `ryg-side`).
 2. **Order of operations.** OCRmyPDF: rotate → remove background → deskew → clean. We find the gutter
    before deskew, so a skewed spine smears the column profile. Test: deskew (or estimate the angle) first.
+   **Tested in #29 (Rust): no gain**, halves of a spread are skewed differently; see 8 above.
 3. **Binarise first?** Hypothesis: smaller/faster to profile, but thresholding may erase the shadow or turn
    it into a solid band that reads as ink. Measure the shadow on grey first, then A/B.
 4. **Rust candidates to spike:** `lopdf` (read/write, no render), `hayro` (pure-Rust render),

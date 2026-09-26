@@ -1,7 +1,12 @@
-// bitonalPDF Rust spike (#28): PDF in (embedded page image or render) -> 1-bit -> CCITT G4 PDF out.
-// Text mode only, no --rotate/--crop/--split/--deskew yet (#29). Same CLI as bitonalpdf.sh:
-//   bitonalpdf [--split off] input.pdf [output.pdf] [threshold%=60] [dpi=300]
-// BITONAL_TIMING=1 prints per-page source and stage times (ms) to stderr; BITONAL_RENDER=1 always renders.
+// bitonalPDF Rust spike (#28 PDF I/O, #29 image ops): PDF in (embedded page image or render) -> rotate/crop/split/
+// deskew -> 1-bit -> CCITT G4 PDF out. Same CLI as bitonalpdf.sh (text mode):
+//   bitonalpdf [--rotate] [--crop] [--split auto|off|N%] [--deskew] input.pdf [output.pdf] [threshold%=60] [dpi=300]
+// BITONAL_TIMING=1 prints per-page geometry and stage times (ms) to stderr; BITONAL_RENDER=1 always renders.
+// A/B knobs for the pipeline-order questions of #29 (docs/rust-port.md section 2):
+//   BITONAL_ADPI=<dpi>      analysis (crop/gutter) resolution, default = dpi (150 flips crop decisions, section 2)
+//   BITONAL_SLOTFLAT=1      flatten each slot after crop/deskew like bash, instead of once on the full page
+//   BITONAL_DESKEW_FIRST=1  estimate the skew on the whole page and straighten it before measuring crop/gutter
+//   BITONAL_INKGUTTER=1     gutter profile from the 60 % ink map instead of the lenient grey level (threshold once)
 use hayro::hayro_interpret::font::Glyph;
 use hayro::hayro_interpret::hayro_syntax::Pdf;
 use hayro::hayro_interpret::hayro_syntax::page::Page;
@@ -16,39 +21,189 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
+// Tunables, same names and values as bitonalpdf.sh (see there and docs/lessons.md for why).
+const OSD_MIN_CONFIDENCE: f32 = 1.0;
+const DOUBLE_AR_MIN: f64 = 1.15;
+const GUTTER_INK_THRESH: f32 = 230.0;
+const GUTTER_SEARCH_LO: f64 = 0.20;
+const GUTTER_SEARCH_HI: f64 = 0.80;
+const GUTTER_MIN_WIDTH_FRAC: f64 = 0.006;
+const GUTTER_MAX_WIDTH_FRAC: f64 = 0.22;
+const GUTTER_MIN_INK_FRAC: f64 = 0.03;
+const GUTTER_EDGE_SHAVE: f64 = 0.03;
+const GUTTER_MIN_INK_ROWS: u32 = 2;
+const GUTTER_TRUST_FRAC: f64 = 0.08;
+const GUTTER_VALLEY_RATIO: f64 = 0.5;
+const GRID_ROWS: usize = 48;
+const CROP_MIN_DENSITY: f64 = 0.03;
+const CROP_MAX_DENSITY: f64 = 0.55;
+const CROP_MIN_RUN: f64 = 0.005;
+const CROP_RUN_GAP: f64 = 0.003;
+const CROP_NEAR_DENSITY: f64 = 0.004;
+const CROP_NEAR_FRAC: f64 = 0.08;
+const CROP_BAND_FRAC: f64 = 0.10;
+const CROP_EDGE_FRAC: f64 = 0.015;
+const CROP_PAD_FRAC: f64 = 0.012;
+const BLUR_SIGMA: f32 = 30.0; // px at the output dpi, like bash's -blur 0x30
+const SKEW_MAX_DEG: f32 = 10.0;
+
 struct Gray {
     w: u32,
     h: u32,
     px: Vec<u8>,
 }
 
+/// Grey image, 0 = black .. 1 = white.
+#[derive(Clone)]
+struct Img {
+    w: usize,
+    h: usize,
+    px: Vec<f32>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Split {
+    Off,
+    Auto,
+    Fixed(f64),
+}
+
+struct Cfg {
+    rotate: bool,
+    crop: bool,
+    deskew: bool,
+    split: Split,
+    thresh: f32,
+    dpi: f32,
+    adpi: f32,
+    slot_flat: bool,
+    deskew_first: bool,
+    ink_gutter: bool,
+    timing: bool,
+}
+
+/// Pass A result for one page, in output-dpi pixels (after the quarter-turn `rot`, and after straightening by
+/// `angle` when deskew-first).
+#[derive(Default, Clone)]
+struct Meta {
+    rot: u32,
+    angle: f32,
+    w: i64,
+    trim: Option<[i64; 4]>, // x0 y0 x1 y1
+    cand: bool,
+    gutter: Option<(i64, i64)>, // x, width
+}
+
+/// What pass B cuts from a page: nothing (whole page), one box, or a split at gx.
+#[derive(Clone, Copy)]
+enum Plan {
+    Whole,
+    Box([i64; 4]),
+    Split([i64; 4], i64),
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let env = |k: &str| std::env::var_os(k).is_some();
+    let mut cfg = Cfg {
+        rotate: false,
+        crop: false,
+        deskew: false,
+        split: Split::Off,
+        thresh: 60.0,
+        dpi: 300.0,
+        adpi: std::env::var("BITONAL_ADPI").ok().and_then(|s| s.parse().ok()).unwrap_or(f32::MAX),
+        slot_flat: env("BITONAL_SLOTFLAT"),
+        deskew_first: env("BITONAL_DESKEW_FIRST"),
+        ink_gutter: env("BITONAL_INKGUTTER"),
+        timing: env("BITONAL_TIMING"),
+    };
     let mut pos = vec![];
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--split" if it.next().map(String::as_str) == Some("off") => {}
-            s if s.starts_with("--") => die(&format!("{s}: not in the Rust spike yet (#29)")),
+            "--rotate" => cfg.rotate = true,
+            "--crop" => cfg.crop = true,
+            "--deskew" => cfg.deskew = true,
+            "--split" => {
+                cfg.split = match it.next().map(String::as_str) {
+                    Some("auto") => Split::Auto,
+                    Some("off") => Split::Off,
+                    Some(s) if s.ends_with('%') => {
+                        Split::Fixed(s.trim_end_matches('%').parse().unwrap_or_else(|_| die("bad --split")))
+                    }
+                    _ => die("--split auto|off|N%"),
+                }
+            }
+            s if s.starts_with("--") => die(&format!("{s}: unknown option")),
             _ => pos.push(a.clone()),
         }
     }
-    let input = pos.first().unwrap_or_else(|| die("usage: bitonalpdf input.pdf [output.pdf] [threshold%] [dpi]"));
+    let input = pos.first().unwrap_or_else(|| die("usage: bitonalpdf [--rotate] [--crop] [--split auto|off|N%] [--deskew] input.pdf [output.pdf] [threshold%] [dpi]"));
     let output = pos.get(1).cloned().unwrap_or_else(|| format!("{}.1bit.pdf", input.trim_end_matches(".pdf")));
-    let thresh: f32 = pos.get(2).map_or(60.0, |s| s.parse().unwrap_or_else(|_| die("bad threshold")));
-    let dpi: f32 = pos.get(3).map_or(300.0, |s| s.parse().unwrap_or_else(|_| die("bad dpi")));
+    cfg.thresh = pos.get(2).map_or(60.0, |s| s.parse().unwrap_or_else(|_| die("bad threshold")));
+    cfg.dpi = pos.get(3).map_or(300.0, |s| s.parse().unwrap_or_else(|_| die("bad dpi")));
+    cfg.adpi = cfg.adpi.min(cfg.dpi);
     if &output == input {
         die("output must differ from input");
     }
-    let timing = std::env::var_os("BITONAL_TIMING").is_some();
+    if cfg.rotate && std::process::Command::new("tesseract").arg("--version").output().is_err() {
+        eprintln!("--rotate needs tesseract — proceeding without rotation");
+        cfg.rotate = false;
+    }
 
     let data = Arc::new(std::fs::read(input).unwrap_or_else(|e| die(&format!("{input}: {e}"))));
     let n = Pdf::new(data.clone()).unwrap_or_else(|e| die(&format!("{input}: {e:?}"))).pages().len();
+    let t0 = Instant::now();
 
-    // One Pdf per thread: hayro's page/cache types are not Send. Pages are handed out by an atomic counter.
+    // Pass A: geometry per page. Only needed for crop/split, or to find the page skew first.
+    let geometry = cfg.crop || cfg.split != Split::Off || cfg.rotate || (cfg.deskew && cfg.deskew_first);
+    let metas: Vec<Meta> = if geometry { par_pages(&data, n, |p, i| measure(p, i, &cfg)) } else { vec![Meta::default(); n] };
+    let t1 = Instant::now();
+
+    // Between passes: document medians, per-page plan, one canvas size (same rules as bitonalpdf.sh).
+    let (plans, review) = plan(&metas, &cfg);
+    let (mut tw, mut th) = (0, 0);
+    for p in &plans {
+        match *p {
+            Plan::Box([x0, y0, x1, y1]) => (tw, th) = (tw.max(x1 - x0), th.max(y1 - y0)),
+            Plan::Split([x0, y0, x1, y1], gx) => (tw, th) = (tw.max(gx - x0).max(x1 - gx), th.max(y1 - y0)),
+            Plan::Whole => {}
+        }
+    }
+    if cfg.timing {
+        eprintln!("canvas {tw}x{th}");
+    }
+
+    // Pass B: cut, deskew, centre on the canvas, flatten + threshold, G4.
+    let pages: Vec<(u32, u32, Vec<u8>)> =
+        par_pages(&data, n, |p, i| finish(p, i, &metas[i], plans[i], (tw, th), &cfg)).into_iter().flatten().collect();
+    let t2 = Instant::now();
+    if cfg.timing {
+        eprintln!("pass A {} ms, pass B {} ms", (t1 - t0).as_millis(), (t2 - t1).as_millis());
+    }
+
+    let pdf = write_pdf(&pages, cfg.dpi);
+    let (in_len, out_len) = (data.len(), pdf.len());
+    if out_len >= in_len {
+        println!("Not smaller ({in_len} B is already small) — no file written");
+        return;
+    }
+    std::fs::write(&output, pdf).unwrap_or_else(|e| die(&format!("{output}: {e}")));
+    println!("{in_len} B -> {out_len} B: {output}");
+    if !review.is_empty() {
+        let l: Vec<String> = review.iter().map(|i| (i + 1).to_string()).collect();
+        eprintln!("Warning: pages look like double pages but no confident gutter was found — left unsplit: {}", l.join(","));
+        eprintln!("Check these by hand, or re-run with --split <N%> to force a gutter position.");
+        std::process::exit(2);
+    }
+}
+
+/// Run f on every page, one Pdf per thread (hayro's page/cache types are not Send), results in page order.
+fn par_pages<T: Send>(data: &Arc<Vec<u8>>, n: usize, f: impl Fn(&Page, usize) -> T + Sync) -> Vec<T> {
     let next = AtomicUsize::new(0);
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(n.max(1));
-    let mut pages: Vec<(usize, u32, u32, Vec<u8>)> = std::thread::scope(|s| {
+    let mut out: Vec<(usize, T)> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..threads)
             .map(|_| {
                 s.spawn(|| {
@@ -59,34 +214,170 @@ fn main() {
                         if i >= n {
                             break done;
                         }
-                        let t0 = Instant::now();
-                        let (g, src) = page_gray(&pdf.pages()[i], dpi);
-                        let t1 = Instant::now();
-                        let bits = binarize(&g, thresh);
-                        let t2 = Instant::now();
-                        let g4 = encode_g4(&bits, g.w);
-                        if timing {
-                            let ms = |a: Instant, b: Instant| (b - a).as_millis();
-                            eprintln!("page {} {src} {}x{}: get {} binarize {} g4 {} ms, {} B",
-                                i + 1, g.w, g.h, ms(t0, t1), ms(t1, t2), ms(t2, Instant::now()), g4.len());
-                        }
-                        done.push((i, g.w, g.h, g4));
+                        done.push((i, f(&pdf.pages()[i], i)));
                     }
                 })
             })
             .collect();
         hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
     });
-    pages.sort_by_key(|p| p.0);
+    out.sort_by_key(|p| p.0);
+    out.into_iter().map(|p| p.1).collect()
+}
 
-    let pdf = write_pdf(&pages, dpi);
-    let (in_len, out_len) = (data.len(), pdf.len());
-    if out_len >= in_len {
-        println!("Not smaller ({in_len} B is already small) — no file written");
-        return;
+/// The page at the output dpi, turned by its OSD quarter turn.
+fn load(page: &Page, cfg: &Cfg, rot: u32) -> Img {
+    let (g, _) = page_gray(page, cfg.dpi, true);
+    rot90(&Img { w: g.w as usize, h: g.h as usize, px: g.px.iter().map(|&v| v as f32 / 255.0).collect() }, rot)
+}
+
+/// Pass A: rotation, skew (deskew-first only), text box and gutter of one page. Measured on a copy
+/// downsampled to the analysis dpi, results scaled back to output pixels.
+fn measure(page: &Page, i: usize, cfg: &Cfg) -> Meta {
+    let t0 = Instant::now();
+    let (g, _) = page_gray(page, cfg.dpi, false);
+    let mut g = Img { w: g.w as usize, h: g.h as usize, px: g.px.iter().map(|&v| v as f32 / 255.0).collect() };
+    let rot = if cfg.rotate { osd(&g) } else { 0 };
+    g = rot90(&g, rot);
+    let t1 = Instant::now();
+    let k = (cfg.dpi / cfg.adpi).round().max(1.0) as usize;
+    let a = downsample(&g, k);
+    let mut flat = flatten(&a, BLUR_SIGMA / k as f32);
+    let mut angle = 0.0;
+    if cfg.deskew && cfg.deskew_first {
+        angle = skew_angle(&flat.px.iter().map(|&v| v < 0.6).collect::<Vec<_>>(), flat.w, flat.h);
+        flat = rotate(&flat, angle, flat.w, flat.h, 1.0);
     }
-    std::fs::write(&output, pdf).unwrap_or_else(|e| die(&format!("{output}: {e}")));
-    println!("{in_len} B -> {out_len} B: {output}");
+    let ink: Vec<bool> = flat.px.iter().map(|&v| v <= 0.6).collect();
+    let (w, h) = (g.w as i64, g.h as i64);
+    let kk = k as i64;
+    let mut m = Meta { rot, angle, w, cand: w as f64 / h as f64 >= DOUBLE_AR_MIN, ..Default::default() };
+    if cfg.crop || cfg.split != Split::Off {
+        let [x0, y0, x1, y1] = content_box(&ink, flat.w, flat.h);
+        m.trim = Some([x0 as i64 * kk, y0 as i64 * kk, (x1 as i64 * kk).min(w), (y1 as i64 * kk).min(h)]);
+    }
+    if m.cand {
+        m.gutter = match cfg.split {
+            Split::Fixed(f) => Some(((w as f64 * f / 100.0) as i64, 0)),
+            Split::Auto => {
+                let prof = if cfg.ink_gutter {
+                    Img { w: flat.w, h: flat.h, px: ink.iter().map(|&b| if b { 0.0 } else { 1.0 }).collect() }
+                } else {
+                    flat
+                };
+                gutter(&prof).map(|(x, gw)| (x as i64 * kk, gw as i64 * kk))
+            }
+            Split::Off => None,
+        };
+    }
+    if cfg.timing {
+        eprintln!("A page {}: get+osd {} ms, analysis {} ms; rot {} angle {:.2} box {:?} double {} gutter {:?}",
+            i + 1, (t1 - t0).as_millis(), t1.elapsed().as_millis(), m.rot, m.angle, m.trim, m.cand, m.gutter);
+    }
+    m
+}
+
+fn median(mut v: Vec<f64>) -> Option<f64> {
+    v.sort_by(f64::total_cmp);
+    let n = v.len();
+    (n > 0).then(|| if n % 2 == 1 { v[n / 2] } else { (v[n / 2 - 1] + v[n / 2]) / 2.0 })
+}
+
+/// Port of the bash between-passes step: median single-page box, median gutter position, per-page plan.
+/// Returns the plans and the pages that look double but got no trusted gutter.
+fn plan(metas: &[Meta], cfg: &Cfg) -> (Vec<Plan>, Vec<usize>) {
+    let singles: Vec<[i64; 4]> = metas.iter().filter(|m| !m.cand).filter_map(|m| m.trim).collect();
+    let single = (cfg.crop && !singles.is_empty()).then(|| {
+        // bash: integer median per edge
+        let med = |k: usize| median(singles.iter().map(|b| b[k] as f64).collect()).unwrap().trunc() as i64;
+        [med(0), med(1), med(2), med(3)]
+    });
+    let wide = |m: &Meta| m.gutter.is_some_and(|(_, gw)| gw as f64 > GUTTER_TRUST_FRAC * m.w as f64);
+    // ponytail: real median; bash's median() truncates the fraction to int, so with an even count it gives 0 there
+    let gfrac = if cfg.split == Split::Auto {
+        median(metas.iter().filter(|m| m.cand && m.gutter.is_some() && !wide(m)).map(|m| m.gutter.unwrap().0 as f64 / m.w as f64).collect())
+    } else {
+        None
+    };
+    let mut review = vec![];
+    let plans = metas
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let Some(t) = m.trim else { return Plan::Whole };
+            if cfg.split != Split::Off && m.cand {
+                let gx = match (m.gutter, gfrac) {
+                    (Some((x, _)), _) if gfrac.is_none() || !wide(m) => Some(x),
+                    (_, Some(f)) if cfg.split == Split::Auto => Some((f * m.w as f64) as i64),
+                    _ => None,
+                };
+                if let Some(gx) = gx {
+                    let [mut x0, y0, mut x1, y1] = t;
+                    // a blank facing page: mirror the other half's width instead of collapsing it
+                    if x0 >= gx {
+                        x0 = (gx - (x1 - gx)).max(0);
+                    }
+                    if x1 <= gx {
+                        x1 = (gx + (gx - x0)).min(m.w);
+                    }
+                    return Plan::Split([x0, y0, x1, y1], gx);
+                }
+                review.push(i);
+            }
+            match (cfg.crop, single) {
+                (true, Some(s)) => Plan::Box(s),
+                (true, None) => Plan::Box(t),
+                _ => Plan::Whole,
+            }
+        })
+        .collect();
+    (plans, review)
+}
+
+/// Pass B: one or two finished slots (w, h, G4) for a page.
+fn finish(page: &Page, i: usize, m: &Meta, plan: Plan, (tw, th): (i64, i64), cfg: &Cfg) -> Vec<(u32, u32, Vec<u8>)> {
+    let t0 = Instant::now();
+    let mut src = load(page, cfg, m.rot);
+    let t1 = Instant::now();
+    if !cfg.slot_flat {
+        src = flatten(&src, BLUR_SIGMA);
+    }
+    if m.angle != 0.0 {
+        src = rotate(&src, m.angle, src.w, src.h, 1.0);
+    }
+    let (w, h) = (src.w as i64, src.h as i64);
+    let boxes = match plan {
+        Plan::Whole => vec![[0, 0, w, h]],
+        Plan::Box(b) => vec![b],
+        Plan::Split([x0, y0, x1, y1], gx) => vec![[x0, y0, gx, y1], [gx, y0, x1, y1]],
+    };
+    let extent = tw > 0 && !matches!(plan, Plan::Whole);
+    let mut angles = vec![];
+    let out = boxes
+        .iter()
+        .map(|&b| {
+            let s = crop(&src, b);
+            // Skew per slot: on the ink of the flattened slot (bash: raw grey < 40 %).
+            let angle = if cfg.deskew {
+                let ink: Vec<bool> = if cfg.slot_flat { s.px.iter().map(|&v| v < 0.4).collect() } else { s.px.iter().map(|&v| v < 0.6).collect() };
+                skew_angle(&ink, s.w, s.h)
+            } else {
+                0.0
+            };
+            angles.push(angle);
+            let (cw, ch) = if extent { (tw as usize, th as usize) } else { (s.w, s.h) };
+            let mut c = rotate(&s, angle, cw, ch, 1.0);
+            if cfg.slot_flat {
+                c = flatten(&c, BLUR_SIGMA);
+            }
+            let bits = hyst(&c, cfg.thresh);
+            (c.w as u32, c.h as u32, encode_g4(&bits, c.w as u32))
+        })
+        .collect();
+    if cfg.timing {
+        eprintln!("B page {}: get {} ms, rest {} ms, deskew {:?}", i + 1, (t1 - t0).as_millis(), t1.elapsed().as_millis(), angles);
+    }
+    out
 }
 
 fn die(msg: &str) -> ! {
@@ -97,14 +388,14 @@ fn die(msg: &str) -> ! {
 /// The page as 8-bit gray at `dpi`, pixel size rounded up like pdftoppm. A page that is nothing
 /// but one raster image filling the page at (nearly) this resolution is decoded directly;
 /// anything else is rendered.
-fn page_gray(page: &Page, dpi: f32) -> (Gray, &'static str) {
+fn page_gray(page: &Page, dpi: f32, smooth: bool) -> (Gray, &'static str) {
     let (pw, ph) = page.render_dimensions();
     let s = dpi / 72.0;
     let (w, h) = ((pw * s).ceil() as u32, (ph * s).ceil() as u32);
     let init = Affine::scale_non_uniform(w as f64 / pw as f64, h as f64 / ph as f64) * page.initial_transform(true).to_kurbo();
 
     let settings = InterpreterSettings::default();
-    let mut probe = Probe { w, h, other: false, images: 0, got: None };
+    let mut probe = Probe { w, h, smooth, other: false, images: 0, got: None };
     let ic = InterpreterCache::new();
     let mut ctx = Context::new(init, Rect::new(0.0, 0.0, w as f64, h as f64), &ic, page.xref(), settings.clone());
     interpret_page(page, &mut ctx, &mut probe);
@@ -124,6 +415,7 @@ fn page_gray(page: &Page, dpi: f32) -> (Gray, &'static str) {
 struct Probe {
     w: u32,
     h: u32,
+    smooth: bool,
     other: bool,
     images: u32,
     got: Option<Gray>,
@@ -177,7 +469,16 @@ impl<'a> Device<'a> for Probe {
                         .map(|p| ((p[0] as u32 * 299 + p[1] as u32 * 587 + p[2] as u32 * 114 + 500) / 1000) as u8)
                         .collect(),
                 };
-                self.got = Some(to_page(&Gray { w, h, px }, t, self.w, self.h));
+                let binary = px.iter().all(|&v| v == 0 || v == 255);
+                let mut g = to_page(&Gray { w, h, px }, t, self.w, self.h);
+                // A 1-bit scan a few px off the page size: poppler resamples it with interpolation, which turns a
+                // dithered scanner band into grey that the flatten removes; 1:1 it survived as dots (#28, #29).
+                // Output image only: measured on the smoothed copy, sidste side p4 lost its page numbers (band rule).
+                if self.smooth && binary && (w, h) != (self.w, self.h) && (h, w) != (self.w, self.h) {
+                    let f: Vec<f32> = g.px.iter().map(|&v| v as f32).collect();
+                    g.px = gauss_exact(&f, g.w as usize, g.h as usize, 0.8).iter().map(|&v| v.round() as u8).collect();
+                }
+                self.got = Some(g);
             },
             None,
         );
@@ -202,21 +503,24 @@ fn to_page(g: &Gray, t: Affine, w: u32, h: u32) -> Gray {
     Gray { w, h, px }
 }
 
-/// 1 = ink. Flatten (pixel / blurred copy, sigma 30) then the #20 hysteresis rule:
-/// ink if < thresh, or < 75 % with a pixel < 45 % within radius 2.
-// ponytail: plain port of bitonalpdf.sh finish_slot for timing and size; parity tuning belongs to #29.
-fn binarize(g: &Gray, thresh: f32) -> Vec<bool> {
-    let (w, h) = (g.w as usize, g.h as usize);
-    let src: Vec<f32> = g.px.iter().map(|&v| v as f32).collect();
-    let blur = gauss(&src, w, h, 30.0);
-    let flat: Vec<f32> = src.iter().zip(&blur).map(|(s, b)| if *b <= 0.0 { 1.0 } else { (s / b).min(1.0) }).collect();
+/// Divide by a blurred copy (background flattening), explicitly: no library compose semantics (#22).
+fn flatten(g: &Img, sigma: f32) -> Img {
+    let blur = gauss(&g.px, g.w, g.h, sigma);
+    let px = g.px.iter().zip(&blur).map(|(s, b)| if *b <= 0.0 { 1.0 } else { (s / b).min(1.0) }).collect();
+    Img { w: g.w, h: g.h, px }
+}
+
+/// 1 = ink. The #20 hysteresis rule on a flattened image: ink if < thresh, or < 75 % with a pixel < 45 %
+/// within radius 2.
+fn hyst(flat: &Img, thresh: f32) -> Vec<bool> {
+    let (w, h) = (flat.w, flat.h);
     let (t, weak, seed) = (thresh / 100.0, 0.75f32.max(thresh / 100.0), 0.45);
-    let seeds: Vec<bool> = flat.iter().map(|&v| v < seed).collect();
+    let seeds: Vec<bool> = flat.px.iter().map(|&v| v < seed).collect();
     let r = 2isize;
     let mut out = vec![false; w * h];
     for y in 0..h {
         for x in 0..w {
-            let v = flat[y * w + x];
+            let v = flat.px[y * w + x];
             out[y * w + x] = v < t
                 || (v < weak
                     && (-r..=r).any(|dy| (-r..=r).any(|dx| {
@@ -230,29 +534,361 @@ fn binarize(g: &Gray, thresh: f32) -> Vec<bool> {
     out
 }
 
-/// Gaussian blur approximated by three box blurs per axis (error < 3 %), edges clamped.
-fn gauss(src: &[f32], w: usize, h: usize, sigma: f32) -> Vec<f32> {
-    let r = (((12.0 * sigma * sigma / 3.0) + 1.0).sqrt() / 2.0).round() as usize;
-    let mut a = src.to_vec();
-    let mut b = vec![0.0; a.len()];
-    for _ in 0..3 {
-        box_pass(&a, &mut b, w, h, r, 1, w); // rows
-        box_pass(&b, &mut a, h, w, r, w, 1); // columns
+/// Area-average downsample by an integer factor (edge remainder dropped).
+fn downsample(g: &Img, k: usize) -> Img {
+    if k == 1 {
+        return g.clone();
     }
-    a
-}
-
-/// One box blur of radius r along lines of length n (stride `step`), `m` lines `lstep` apart.
-fn box_pass(src: &[f32], dst: &mut [f32], n: usize, m: usize, r: usize, step: usize, lstep: usize) {
-    let norm = 1.0 / (2 * r + 1) as f32;
-    for l in 0..m {
-        let at = |i: isize| src[l * lstep + (i.clamp(0, n as isize - 1) as usize) * step];
-        let mut acc: f32 = (-(r as isize)..=r as isize).map(at).sum();
-        for i in 0..n as isize {
-            dst[l * lstep + i as usize * step] = acc * norm;
-            acc += at(i + r as isize + 1) - at(i - r as isize);
+    let (w, h) = (g.w / k, g.h / k);
+    let mut px = vec![0.0; w * h];
+    for y in 0..h * k {
+        for x in 0..w * k {
+            px[(y / k) * w + x / k] += g.px[y * g.w + x];
         }
     }
+    let n = (k * k) as f32;
+    px.iter_mut().for_each(|v| *v /= n);
+    Img { w, h, px }
+}
+
+/// Quarter turn clockwise, `deg` in 0/90/180/270 (ImageMagick -rotate).
+fn rot90(g: &Img, deg: u32) -> Img {
+    let (w, h) = (g.w, g.h);
+    match deg {
+        90 => Img { w: h, h: w, px: (0..w * h).map(|i| { let (x, y) = (i % h, i / h); g.px[(h - 1 - x) * w + y] }).collect() },
+        180 => Img { w, h, px: g.px.iter().rev().copied().collect() },
+        270 => Img { w: h, h: w, px: (0..w * h).map(|i| { let (x, y) = (i % h, i / h); g.px[x * w + (w - 1 - y)] }).collect() },
+        _ => g.clone(),
+    }
+}
+
+/// Rotate g by `deg` (positive = the content turns counter-clockwise, undoing a clockwise skew of that angle)
+/// about its centre and place it centred on a cw x ch canvas of `fill`, bilinear. deg 0 = exact integer shift.
+fn rotate(g: &Img, deg: f32, cw: usize, ch: usize, fill: f32) -> Img {
+    let (ox, oy) = ((cw as i64 - g.w as i64) / 2, (ch as i64 - g.h as i64) / 2);
+    let mut px = vec![fill; cw * ch];
+    if deg.abs() < 0.01 {
+        for y in 0..g.h as i64 {
+            let yy = y + oy;
+            if yy < 0 || yy >= ch as i64 {
+                continue;
+            }
+            for x in 0..g.w as i64 {
+                let xx = x + ox;
+                if xx >= 0 && xx < cw as i64 {
+                    px[yy as usize * cw + xx as usize] = g.px[y as usize * g.w + x as usize];
+                }
+            }
+        }
+        return Img { w: cw, h: ch, px };
+    }
+    let (s, c) = deg.to_radians().sin_cos();
+    let (gcx, gcy) = (g.w as f32 / 2.0, g.h as f32 / 2.0);
+    let (ccx, ccy) = (ox as f32 + gcx, oy as f32 + gcy);
+    let at = |x: i64, y: i64| if x < 0 || y < 0 || x >= g.w as i64 || y >= g.h as i64 { fill } else { g.px[y as usize * g.w + x as usize] };
+    for y in 0..ch {
+        for x in 0..cw {
+            let (u, v) = (x as f32 + 0.5 - ccx, y as f32 + 0.5 - ccy);
+            let (sx, sy) = (gcx + u * c - v * s - 0.5, gcy + u * s + v * c - 0.5);
+            let (x0, y0) = (sx.floor(), sy.floor());
+            let (fx, fy) = (sx - x0, sy - y0);
+            let (x0, y0) = (x0 as i64, y0 as i64);
+            px[y * cw + x] = (at(x0, y0) * (1.0 - fx) + at(x0 + 1, y0) * fx) * (1.0 - fy)
+                + (at(x0, y0 + 1) * (1.0 - fx) + at(x0 + 1, y0 + 1) * fx) * fy;
+        }
+    }
+    Img { w: cw, h: ch, px }
+}
+
+/// Sub-image [x0,x1) x [y0,y1), clamped to the image.
+fn crop(g: &Img, [x0, y0, x1, y1]: [i64; 4]) -> Img {
+    let cl = |v: i64, m: usize| v.clamp(0, m as i64) as usize;
+    let (x0, x1, y0, y1) = (cl(x0, g.w), cl(x1, g.w), cl(y0, g.h), cl(y1, g.h));
+    let (w, h) = (x1.saturating_sub(x0), y1.saturating_sub(y0));
+    Img { w, h, px: (y0..y0 + h).flat_map(|y| g.px[y * g.w + x0..y * g.w + x0 + w].iter().copied()).collect() }
+}
+
+/// Skew of the text lines in degrees (positive = lines fall to the right), projection-profile method
+/// (Postl): the angle whose row projection of the ink is sharpest (largest sum of squared differences between
+/// neighbouring rows; plain squared counts plateau over ~0.1° for thick lines).
+/// Coarse 0.25° steps over ±SKEW_MAX_DEG, then 0.025° around the best.
+// ponytail: O(ink pixels x angles), ~80+20 angles; subsample the ink if big pages at high dpi get slow
+fn skew_angle(ink: &[bool], w: usize, h: usize) -> f32 {
+    let cx = w as f32 / 2.0;
+    let pts: Vec<(f32, f32)> = (0..w * h).filter(|&i| ink[i]).map(|i| ((i % w) as f32 - cx, (i / w) as f32)).collect();
+    if pts.len() < 100 {
+        return 0.0;
+    }
+    let off = (cx * SKEW_MAX_DEG.to_radians().tan()).ceil() + 1.0;
+    let mut bins = vec![0u32; h + 2 * off as usize + 2];
+    let mut score = |deg: f32| {
+        let t = deg.to_radians().tan();
+        bins.iter_mut().for_each(|b| *b = 0);
+        for &(x, y) in &pts {
+            bins[(y - x * t + off) as usize] += 1;
+        }
+        bins.windows(2).map(|p| (p[1] as f64 - p[0] as f64).powi(2)).sum::<f64>()
+    };
+    // Middle of the best plateau: near the true angle the bins only change once a line end moves a whole pixel.
+    let best = |score: &mut dyn FnMut(f32) -> f64, lo: f32, step: f32, n: i32| {
+        let s: Vec<(f32, f64)> = (0..=n).map(|k| lo + k as f32 * step).map(|a| (a, score(a))).collect();
+        let m = s.iter().map(|p| p.1).fold(f64::MIN, f64::max);
+        let top: Vec<f32> = s.iter().filter(|p| p.1 == m).map(|p| p.0).collect();
+        (top[0] + top[top.len() - 1]) / 2.0
+    };
+    let a = best(&mut score, -SKEW_MAX_DEG, 0.25, (2.0 * SKEW_MAX_DEG / 0.25) as i32);
+    best(&mut score, a - 0.25, 0.025, 20)
+}
+
+/// Quantise a mean to 8 bit like ImageMagick's `-depth 8` does before the awk sees it.
+fn q8(v: f64) -> f64 {
+    (v * 255.0).round() / 255.0
+}
+
+/// Text-block bounds [x0, y0, x1, y1) of an ink map: rows first, then columns inside the row range
+/// (port of bitonalpdf.sh content_box, see docs/lessons.md 1, 4, 6, 6b).
+fn content_box(ink: &[bool], w: usize, h: usize) -> [usize; 4] {
+    let rows: Vec<f64> = (0..h).map(|y| q8(ink[y * w..(y + 1) * w].iter().filter(|&&b| b).count() as f64 / w as f64)).collect();
+    let (y0, ht) = axis_box(&rows);
+    let sc = ht as f64 / h as f64;
+    let mut cnt = vec![0usize; w];
+    for y in y0..y0 + ht {
+        for x in 0..w {
+            cnt[x] += ink[y * w + x] as usize;
+        }
+    }
+    let cols: Vec<f64> = cnt.iter().map(|&c| q8(c as f64 / ht as f64) * sc).collect();
+    let (x0, wd) = axis_box(&cols);
+    [x0, y0, x0 + wd, y0 + ht]
+}
+
+/// One axis of content_box: (first, length). Literal port of the awk, including its integer truncations.
+fn axis_box(dens: &[f64]) -> (usize, usize) {
+    let n = dens.len() as i64;
+    let nf = n as f64;
+    let ok = |i: i64, lo: f64| i >= 0 && i < n && dens[i as usize] >= lo && dens[i as usize] <= CROP_MAX_DENSITY;
+    let gap = (CROP_RUN_GAP * nf) as i64;
+    let minrun = (CROP_MIN_RUN * nf) as i64;
+    let e0 = (CROP_EDGE_FRAC * nf) as i64;
+    let fin = (nf - 1.0 - CROP_EDGE_FRAC * nf) as i64 + 1;
+    let (mut rs, mut re) = (-1i64, 0i64);
+    let mut all: Option<(i64, i64)> = None;
+    let mut runs: Vec<(i64, i64)> = vec![];
+    for i in e0..=fin {
+        if i < fin && ok(i, CROP_MIN_DENSITY) {
+            if rs < 0 {
+                rs = i;
+            }
+            re = i;
+            continue;
+        }
+        if rs >= 0 && (i - re > gap || i == fin) {
+            all = Some((all.map_or(rs, |a| a.0), re));
+            if re - rs + 1 >= minrun {
+                runs.push((rs, re));
+            }
+            rs = -1;
+        }
+    }
+    let band = (CROP_BAND_FRAC * nf) as i64;
+    let (mut lo_lim, mut hi_lim) = (e0, n - 1 - e0);
+    if runs.len() >= 2 && runs[0].1 <= band {
+        lo_lim = runs[0].1 + 1;
+        runs.remove(0);
+    }
+    if runs.len() >= 2 && runs.last().unwrap().0 >= n - 1 - band {
+        hi_lim = runs.pop().unwrap().0 - 1;
+    }
+    let block = if runs.is_empty() { all } else { Some((runs[0].0, runs.last().unwrap().1)) };
+    let (mut first, mut last) = match block {
+        None => (0, n - 1),
+        Some((f0, l0)) => {
+            let (mut f, mut l) = (f0, l0);
+            let near = CROP_NEAR_FRAC * nf;
+            let mut i = f0 - 1;
+            while i as f64 >= f0 as f64 - near && i >= lo_lim {
+                if ok(i, CROP_NEAR_DENSITY) {
+                    f = i;
+                }
+                i -= 1;
+            }
+            let mut i = l0 + 1;
+            while i as f64 <= l0 as f64 + near && i <= hi_lim {
+                if ok(i, CROP_NEAR_DENSITY) {
+                    l = i;
+                }
+                i += 1;
+            }
+            (f, l)
+        }
+    };
+    first = ((first as f64 - CROP_PAD_FRAC * nf).trunc() as i64).max(0);
+    last = ((last as f64 + CROP_PAD_FRAC * nf).trunc() as i64).min(n - 1);
+    if lo_lim > e0 && first < lo_lim {
+        first = lo_lim;
+    }
+    if hi_lim < n - 1 - e0 && last > hi_lim {
+        last = hi_lim;
+    }
+    (first as usize, (last - first + 1) as usize)
+}
+
+/// Gutter of a double page from a flattened image: Some((x, width)) or None. Port of bash ink_profile + its awk:
+/// column profile over GRID_ROWS bands (top/bottom shaved), widest ink-free run in the centre window, else the
+/// deepest valley of the smoothed ink count.
+fn gutter(flat: &Img) -> Option<(usize, usize)> {
+    let (w, h) = (flat.w, flat.h);
+    let shave = (h as f64 * GUTTER_EDGE_SHAVE) as usize;
+    let hh = h - 2 * shave;
+    // Area average per band. Bash uses -resize (Lanczos); a Lanczos port matched it better per pixel but picked a
+    // gutter 243 px off on skewed p21 (two near-equal ink-free runs), the area average stays within 5 px (#29).
+    let mut cnt = vec![0u32; w];
+    for b in 0..GRID_ROWS {
+        let (r0, r1) = (shave + b * hh / GRID_ROWS, shave + (b + 1) * hh / GRID_ROWS);
+        for x in 0..w {
+            let s: f32 = (r0..r1).map(|y| flat.px[y * w + x]).sum();
+            if ((s / (r1 - r0) as f32) * 255.0).round() < GUTTER_INK_THRESH {
+                cnt[x] += 1;
+            }
+        }
+    }
+    let ink: Vec<bool> = cnt.iter().map(|&c| c >= GUTTER_MIN_INK_ROWS).collect();
+    let wf = w as f64;
+    let (lo, hi) = (GUTTER_SEARCH_LO, GUTTER_SEARCH_HI);
+
+    let valley = || {
+        let sw = ((wf * 0.003) as i64).max(1);
+        let sm: Vec<f64> = (0..w as i64)
+            .map(|x| {
+                let r = (x - sw).max(0)..=(x + sw).min(w as i64 - 1);
+                let n = r.clone().count() as f64;
+                r.map(|k| cnt[k as usize] as f64).sum::<f64>() / n
+            })
+            .collect();
+        let (mut best, mut bx) = (1e9, -1i64);
+        for x in (wf * lo) as i64..=(wf * hi) as i64 {
+            if sm[x as usize] < best {
+                (best, bx) = (sm[x as usize], x);
+            }
+        }
+        let (a1, a2) = ((wf * 0.03) as i64, (wf * 0.15) as i64);
+        let side = |r: std::ops::RangeInclusive<i64>| {
+            let v: Vec<f64> = r.filter(|&k| k >= 0 && k < w as i64).map(|k| sm[k as usize]).collect();
+            (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64)
+        };
+        let (Some(lb), Some(rb)) = (side(bx - a2..=bx - a1), side(bx + a1..=bx + a2)) else { return None };
+        let r = GUTTER_VALLEY_RATIO;
+        (bx >= 0 && best <= r * lb && best <= r * rb && lb > 0.0 && rb > 0.0).then_some((bx as usize, 0))
+    };
+
+    let (mut bestlen, mut best) = (-1i64, None);
+    let mut start: Option<usize> = None;
+    for x in 0..=w {
+        if x < w && !ink[x] {
+            start.get_or_insert(x);
+        } else if let Some(rs) = start.take() {
+            let re = x - 1;
+            let mid = (rs + re) as f64 / 2.0 / wf;
+            if mid >= lo && mid <= hi && (re - rs) as i64 > bestlen {
+                (bestlen, best) = ((re - rs) as i64, Some((rs, re)));
+            }
+        }
+    }
+    let Some((bs, be)) = best else { return valley() };
+    let (gx, gw) = ((bs + be) / 2, be - bs);
+    let half = w / 2;
+    let li = ink[..half].iter().filter(|&&b| b).count() as f64 / half as f64;
+    let ri = ink[half..].iter().filter(|&&b| b).count() as f64 / (w - half) as f64;
+    let (gf, gwf) = (gx as f64 / wf, gw as f64 / wf);
+    let ok = gf >= lo && gf <= hi && gwf >= GUTTER_MIN_WIDTH_FRAC && gwf <= GUTTER_MAX_WIDTH_FRAC
+        && li >= GUTTER_MIN_INK_FRAC && ri >= GUTTER_MIN_INK_FRAC;
+    if ok { Some((gx, gw)) } else { valley() }
+}
+
+/// Tesseract OSD quarter turn (0/90/180/270), like bash rotate_page. Optional system dependency (#30).
+fn osd(g: &Img) -> u32 {
+    let path = std::env::temp_dir().join(format!("bitonal-osd-{}-{:p}.pgm", std::process::id(), g));
+    let mut f = format!("P5 {} {} 255\n", g.w, g.h).into_bytes();
+    f.extend(g.px.iter().map(|&v| (v * 255.0).round() as u8));
+    if std::fs::write(&path, f).is_err() {
+        return 0;
+    }
+    let out = std::process::Command::new("tesseract").arg(&path).args(["stdout", "--psm", "0"]).output();
+    let _ = std::fs::remove_file(&path);
+    let Ok(out) = out else { return 0 };
+    let s = String::from_utf8_lossy(&out.stdout);
+    let field = |k: &str| s.lines().find_map(|l| l.strip_prefix(k)).map(|v| v.trim().to_string());
+    let deg: u32 = field("Rotate:").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let conf: f32 = field("Orientation confidence:").and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    if deg != 0 && conf >= OSD_MIN_CONFIDENCE { deg } else { 0 }
+}
+
+/// Gaussian blur, edges clamped. A sigma-30 blur is smooth, so it is computed on a copy downsampled by k (area
+/// average), with an exact kernel there, and upsampled bilinearly; sigma is reduced by the variance the box and
+/// the tent add. Close to the exact full-size Gaussian (test `blur_matches_exact`) at a fraction of its work.
+/// The earlier 3x box blur was off by up to 9 % at a dark page edge, which flipped crop decisions (#29).
+fn gauss(src: &[f32], w: usize, h: usize, sigma: f32) -> Vec<f32> {
+    let k = ((sigma / 8.0) as usize).max(1);
+    if k == 1 {
+        return gauss_exact(src, w, h, sigma);
+    }
+    // Low-res grid with a 4-sigma border of replicated edge pixels, so the clamp means the same as at full size
+    // (a scan's edge band has a steep gradient in its outer rows; repeating a block average there was off by 1 %).
+    let p = (4.0 * sigma / k as f32).ceil() as usize;
+    let (lw, lh) = (w.div_ceil(k) + 2 * p, h.div_ceil(k) + 2 * p);
+    let at = |x: usize, y: usize| src[(y.saturating_sub(p * k)).min(h - 1) * w + (x.saturating_sub(p * k)).min(w - 1)];
+    let mut low = vec![0.0f32; lw * lh];
+    for y in 0..lh * k {
+        for x in 0..lw * k {
+            low[(y / k) * lw + x / k] += at(x, y);
+        }
+    }
+    let kf = k as f32;
+    low.iter_mut().for_each(|v| *v /= kf * kf);
+    let s = (sigma * sigma - kf * kf / 12.0 - kf * kf / 6.0).sqrt() / kf;
+    let low = gauss_exact(&low, lw, lh, s);
+    // bilinear; low-res pixel j has its centre at (j - p + 0.5) * k - 0.5
+    let coord = |x: usize| {
+        let u = (x as f32 + 0.5) / kf - 0.5 + p as f32;
+        let j = u as usize;
+        (j, j + 1, u - j as f32)
+    };
+    let xs: Vec<_> = (0..w).map(coord).collect();
+    let mut out = vec![0.0; w * h];
+    for y in 0..h {
+        let (j0, j1, fy) = coord(y);
+        let (r0, r1) = (&low[j0 * lw..(j0 + 1) * lw], &low[j1 * lw..(j1 + 1) * lw]);
+        for (x, &(i0, i1, fx)) in xs.iter().enumerate() {
+            let a = r0[i0] + (r0[i1] - r0[i0]) * fx;
+            let b = r1[i0] + (r1[i1] - r1[i0]) * fx;
+            out[y * w + x] = a + (b - a) * fy;
+        }
+    }
+    out
+}
+
+/// Exact separable Gaussian, radius 4 sigma, edges clamped.
+fn gauss_exact(src: &[f32], w: usize, h: usize, sigma: f32) -> Vec<f32> {
+    let r = (4.0 * sigma).ceil() as isize;
+    let k: Vec<f32> = (-r..=r).map(|i| (-(i * i) as f32 / (2.0 * sigma * sigma)).exp()).collect();
+    let norm: f32 = k.iter().sum();
+    let k: Vec<f32> = k.iter().map(|v| v / norm).collect();
+    let pass = |src: &[f32], n: usize, m: usize, step: usize, lstep: usize| {
+        let mut dst = vec![0.0; src.len()];
+        for l in 0..m {
+            for i in 0..n as isize {
+                let mut acc = 0.0;
+                for (j, kv) in k.iter().enumerate() {
+                    let t = (i + j as isize - r).clamp(0, n as isize - 1) as usize;
+                    acc += kv * src[l * lstep + t * step];
+                }
+                dst[l * lstep + i as usize * step] = acc;
+            }
+        }
+        dst
+    };
+    let a = pass(src, w, h, 1, w);
+    pass(&a, h, w, w, 1)
 }
 
 fn encode_g4(bits: &[bool], w: u32) -> Vec<u8> {
@@ -263,14 +899,14 @@ fn encode_g4(bits: &[bool], w: u32) -> Vec<u8> {
     enc.finish().unwrap().finish()
 }
 
-fn write_pdf(pages: &[(usize, u32, u32, Vec<u8>)], dpi: f32) -> Vec<u8> {
+fn write_pdf(pages: &[(u32, u32, Vec<u8>)], dpi: f32) -> Vec<u8> {
     use pdf_writer::{Content, Filter, Name, Pdf, Rect, Ref};
     let mut pdf = Pdf::new();
     let (catalog, tree) = (Ref::new(1), Ref::new(2));
     let ids = |k: usize| (Ref::new(3 + 3 * k as i32), Ref::new(4 + 3 * k as i32), Ref::new(5 + 3 * k as i32));
     pdf.catalog(catalog).pages(tree);
     pdf.pages(tree).kids((0..pages.len()).map(|k| ids(k).0)).count(pages.len() as i32);
-    for (k, (_, w, h, g4)) in pages.iter().enumerate() {
+    for (k, (w, h, g4)) in pages.iter().enumerate() {
         let (page_id, img_id, content_id) = ids(k);
         let (pw, ph) = (*w as f32 * 72.0 / dpi, *h as f32 * 72.0 / dpi);
         let mut page = pdf.page(page_id);
@@ -300,13 +936,75 @@ mod tests {
     fn g4_pdf_roundtrip() {
         let (w, h, dpi) = (301u32, 207u32, 150.0);
         let bits: Vec<bool> = (0..w * h).map(|i| (i % w) * (i / w) % 7 == 0 || (i % w + 2 * (i / w)) % 13 < 3).collect();
-        let pdf = write_pdf(&[(0, w, h, encode_g4(&bits, w))], dpi);
+        let pdf = write_pdf(&[(w, h, encode_g4(&bits, w))], dpi);
         let doc = Pdf::new(Arc::new(pdf)).unwrap();
         let page = &doc.pages()[0];
         let (pw, ph) = page.render_dimensions();
         assert!((pw - w as f32 * 72.0 / dpi).abs() < 0.01 && (ph - h as f32 * 72.0 / dpi).abs() < 0.01);
-        let (g, src) = page_gray(page, dpi);
+        let (g, src) = page_gray(page, dpi, true);
         assert_eq!((src, g.w, g.h), ("image", w, h));
         assert!(g.px.iter().zip(&bits).all(|(&p, &b)| (p < 128) == b));
+    }
+
+    // Text-like lines skewed by +2° (falling to the right): skew_angle finds it, and rotate by that angle
+    // makes the lines horizontal again. Fails with the rotation sign flipped.
+    #[test]
+    fn skew_found_and_undone() {
+        let (w, h) = (600usize, 400usize);
+        let t = 2f32.to_radians().tan();
+        let px: Vec<f32> = (0..w * h)
+            .map(|i| {
+                // 4x4 supersampled, so the lines are anti-aliased like a real scan
+                let ink = (0..16).filter(|k| {
+                    let (x, y) = ((i % w) as f32 + (k % 4) as f32 / 4.0, (i / w) as f32 + (k / 4) as f32 / 4.0);
+                    let yy = y - (x - 300.0) * t;
+                    x > 50.0 && x < 550.0 && yy > 50.0 && yy < 350.0 && yy % 20.0 < 3.0
+                });
+                1.0 - ink.count() as f32 / 16.0
+            })
+            .collect();
+        let g = Img { w, h, px };
+        let ink = |g: &Img| g.px.iter().map(|&v| v < 0.5).collect::<Vec<_>>();
+        let a = skew_angle(&ink(&g), w, h);
+        assert!((a - 2.0).abs() <= 0.05, "{a}");
+        let r = rotate(&g, a, w, h, 1.0);
+        let b = skew_angle(&ink(&r), w, h);
+        assert!(b.abs() <= 0.05, "{b}");
+        assert_eq!(rot90(&rot90(&g, 90), 270).px, g.px);
+        assert_eq!(rot90(&rot90(&g, 90), 90).px, rot90(&g, 180).px);
+    }
+
+    // The fast blur equals the exact Gaussian within 0.1 % of the range, also at a dark edge band and the corners.
+    #[test]
+    fn blur_matches_exact() {
+        let (w, h) = (400usize, 300usize);
+        let px: Vec<f32> = (0..w * h)
+            .map(|i| {
+                let (x, y) = (i % w, i / w);
+                if y < 12 { 0.1 } else if (x * 7 + y * 13) % 11 < 3 { 0.2 } else { 0.95 }
+            })
+            .collect();
+        let (a, b) = (gauss(&px, w, h, 30.0), gauss_exact(&px, w, h, 30.0));
+        let (i, d) = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).enumerate().fold((0, 0.0), |m, v| if v.1 > m.1 { v } else { m });
+        assert!(d < 0.001, "{d} at {},{}: {} vs {}", i % w, i / w, a[i], b[i]);
+    }
+
+    // content_box on a page with a wide band in the top 10 % cut off by a gap, a text block and a sparse
+    // page number below it: the band is dropped, the page number kept (lessons.md 4, 6b).
+    #[test]
+    fn crop_drops_band_keeps_page_number() {
+        let (w, h) = (1000usize, 1400usize);
+        let ink: Vec<bool> = (0..w * h)
+            .map(|i| {
+                let (x, y) = (i % w, i / w);
+                (y > 30 && y < 100 && x < 600) // band
+                    || (y >= 200 && y < 1100 && x >= 150 && x < 850 && (x + y) % 5 == 0) // text block
+                    || (y >= 1180 && y < 1200 && x >= 490 && x < 510) // page number
+            })
+            .collect();
+        let [x0, y0, x1, y1] = content_box(&ink, w, h);
+        assert!(y0 > 100 && y0 < 200, "{y0}");
+        assert!(y1 > 1200, "{y1}");
+        assert!(x0 < 150 && x1 > 850);
     }
 }

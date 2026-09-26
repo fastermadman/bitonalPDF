@@ -1,6 +1,6 @@
 name: rust
 
-# Rust spike (#28): build + the I/O round-trip test on all three OSes. Separate from `check`
+# Rust spike (#28, #29): build + the unit tests (I/O round trip, skew, crop, blur) on all three OSes. Separate from `check`
 # (not a required status) and only when rust/ changes, since macOS/Windows minutes cost more.
 on:
   pull_request:

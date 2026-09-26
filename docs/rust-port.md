@@ -1,9 +1,10 @@
 # Rust port: decisions and measurements
 
 Spike code: `rust/` (one file, `src/main.rs`). Build: `cd rust && cargo build --release`; the binary takes the
-`bitonalpdf.sh` CLI, so `BIN=rust/target/release/bitonalpdf tests/synth.sh` works. Text mode only; `--rotate`,
-`--crop`, `--split auto|N%`, `--deskew` exit with "not in the Rust spike yet" (#29). `BITONAL_TIMING=1` prints
-per-page source (`image`/`render`) and stage times, and `BITONAL_RENDER=1` forces the render path.
+`bitonalpdf.sh` CLI, so `BIN=rust/target/release/bitonalpdf tests/synth.sh` works. Text mode only (no `MODE=images`).
+Since #29 it does `--rotate` (Tesseract, as in bash), `--crop`, `--split auto|off|N%` and `--deskew`.
+`BITONAL_TIMING=1` prints per-page geometry and stage times, `BITONAL_RENDER=1` forces the render path; the A/B knobs of
+section 2 are listed at the top of `main.rs`.
 
 All numbers: Apple M4 (10 cores), macOS, release build, the six local scans in `tests/real/`. Bash = `bitonalpdf.sh`
 **without flags** (same work as the spike: render → flatten → hysteresis threshold → G4), ImageMagick 7.1.2, poppler.
@@ -95,13 +96,13 @@ page 1 as reference):
 
 **Tests with `BIN=`:**
 - `tests/synth.sh`: `flatten` PASS; `spread`, `pagenumber`, `stripe`, `wide-table`, `dark-band` FAIL ("no output
-  written": they need `--crop`/`--split`, #29).
+  written": they need `--crop`/`--split`, #29). All six pass since #29 (section 2).
 - `tests/real.sh --split off`: runs through all six, FAIL on the facts because they were recorded with all four flags
   (sizes/page counts after crop+split). The per-page comparison against bash without flags is the one above.
 - `cargo test`: round trip bitmap → G4 → PDF → hayro → extraction → same bitmap and page size. Shown to fail with the
   G4 polarity flipped and with the fit check broken.
 
-### Dithered 1-bit pages (open, goes to #29)
+### Dithered 1-bit pages (solved in #29, section 2)
 `sidste side …` p4 and p6 are CCITT images from the scanner, 3512×2480 (4 px wider than A4 at 300 dpi), with the dark
 scanner band **dithered**. poppler downsamples them to 3508 px with a filter, which smears the dither into grey, and
 flatten then blanks the band's middle. The spike maps them 1:1 (nearest-neighbour, dropping 4 columns), so the
@@ -119,3 +120,163 @@ on 1-bit sources before flatten, or leave it to `--crop` (the band is exactly wh
 Floor and target met: page count and page size identical, size −0.5 … −2.1 % at the same 1-bit input, ≈ 46× less CPU per
 page, one static-ish 6.6 MB binary, all licences permissive. Stack: **hayro (read, extract, render) + fax (G4) +
 pdf-writer (PDF)**.
+
+## 2. Image ops and pipeline order (#29)
+
+### What was built
+All of `bitonalpdf.sh` text mode is ported in `rust/src/main.rs`, with **no new crates**: every op is plain Rust over a
+`Vec<f32>` page (0 = black … 1 = white).
+
+| Op | How | Bash equivalent |
+|---|---|---|
+| Flatten | pixel ÷ Gaussian(σ 30) of the page, written out (no compose enum, #22). Gaussian: exact kernel on a ¼-size copy with a 4σ border of replicated edge pixels, bilinear back up. Max error vs an exact full-size Gaussian 0.03 % (`blur_matches_exact`) | `-blur 0x30` + `Divide_Dst/Src` |
+| Threshold | #20 hysteresis rule per pixel (< 60 %, or < 75 % with a seed < 45 % within radius 2) | `-threshold`, `-morphology Dilate Disk:2` |
+| Crop box | literal port of the `content_box` awk (density rows, then columns inside the row range, runs, band rule, near-extension, pad), including 8-bit quantisation of densities and awk's integer truncations | `content_box` |
+| Gutter | per-column dark count over 48 bands (lenient grey < 230), widest ink-free run, valley fallback | `ink_profile` + awk |
+| Plan | median single-page box, median gutter fraction (a real median, see #40), blank-page mirroring, one canvas = largest box | between passes |
+| Deskew | own projection-profile estimator (Postl): coarse 0.25° over ±10°, then 0.025°, score = Σ(Δ row count)², middle of the best plateau; bilinear rotation onto the canvas | `-deskew 40%` |
+| Orientation | Tesseract OSD via `tesseract … --psm 0` exactly as bash; optional, skipped with a warning if missing (#30 decides the replacement) | `rotate_page` |
+
+Two passes like bash: pass A measures every page (the medians and the canvas need all pages), pass B gets the page
+again, flattens it once, cuts, deskews each slot, centres it on the canvas, thresholds and encodes. Pass B re-decodes the
+page (30–80 ms) instead of keeping 23 flattened pages in memory.
+
+Tests: `cargo test` covers the G4/PDF round trip (#28), skew found and undone (fails with the rotation sign flipped),
+crop drops a band but keeps a page number, fast blur = exact blur. `tests/synth.sh` with `BIN=`: all six PASS, same
+numbers as bash within 1–2 px (e.g. `spread` 354 vs 359 pt wide, `wide-table` 106 vs 109 pt high).
+
+### Reference: bash has a bug on `skewed` (#40)
+The committed `skewed.facts` say every output page is 791.52 pt wide: bash's `median()` truncates the median gutter
+**fraction** to `int`, which is 0 for an even count (22 trusted gutters on `skewed`), so page 22 is split at x = 0 and
+the canvas becomes the whole spread. All parity numbers below are against bash **with that one line fixed** (scratch copy;
+the other four scans give byte-identical facts with and without the fix). `tests/real.sh` got `SIZE_TOL=<pt>` for a
+second implementation, because an exact page-size match needs the same pixel on every page's box edge.
+
+### Parity with bash (all four flags)
+Tolerances: page size ≤ 3 pt (12 px, 0.6 % of the page), ink box ±20 ‰ (`FACT_TOL`), footer flag equal, page count equal.
+
+| Scan | pages | bash wall / CPU | Rust wall | size bash → Rust | pages outside tolerance |
+|---|---:|---:|---:|---:|---|
+| skewed | 23 → 46 | 177 s / 638 s | 5.2 s | 1 876 → 1 859 kB (−0.9 %) | 4: p1, 39, 41, 43 |
+| sidste side | 8 → 16 | 49 s / 171 s | 2.2 s | 797 → 769 kB (−3.5 %) | 4: p1, 7, 8, 11 |
+| ryg-side | 1 → 2 | 19 s | 1.4 s | 101 → 101 kB (−0.2 %) | 0 |
+| ren-side | 1 → 1 | 10 s | 0.7 s | 53 → 51 kB (−4.2 %) | 0 |
+| flerspaltet | 9 → 9 | 44 s / 131 s | 1.5 s | 514 → 506 kB (−1.6 %) | 0 |
+| ren pdf | 1 | 19 s | | not smaller, no file (both) | |
+
+Page counts, split decisions and page sizes (within 0.24 pt = 1 px) match on every scan. The per-page geometry was also
+compared directly (bash `meta/` files vs the Rust pass A, px at 300 dpi): crop boxes within ±3 px on 40 of 42 pages,
+gutters within ±5 px on 29 of 31 double pages; `sidste` p7 is 9 px off, `sidste` p4 (a dithered 1-bit page) 38 px, still
+inside its 150 px wide blank spine gap. The 8 pages outside tolerance, each looked at:
+- **skewed p39/41/43** (left pages): a speck in the right margin. The gutter is 4–5 px further right than in bash, so the
+  slot takes 4–5 px more of the spine. Text identical.
+- **skewed p1** (left half of the first spread, a nearly blank page): the text block of the right page starts at column
+  2091 in both; the 8 % near-window reaches back to column 1811, which has density 1/255 in bash and 3/255 in Rust. Rust
+  extends the box over a 250 px sliver of the left page's line ends, bash mirrors the right page's width. Both cut the few
+  lines on that page; bash shows more of them. A cliff of the crop rule, not of the port (below).
+- **sidste p1** (blank facing page): 2–3 specks instead of 1.
+- **sidste p7/8/11** (the dithered 1-bit scan pages): Rust is **cleaner**: no dither dots along the edge, no spine line,
+  same text, page numbers 18/19/22 present; 49–52 kB instead of 55–59 kB per page.
+
+Thin strokes: black fraction on `skewed` pp. 9–12 bash vs Rust 10.66/10.65 %, 8.82/8.88 %, 9.83/9.83 %, 8.05/7.67 %
+(the last: fewer margin marks); a 500×160 px crop of body text is indistinguishable.
+
+### What it took to get there (goes into lessons)
+1. **The blur kernel decides crop edges.** The #28 flatten (3 box blurs) was up to 9 % off the Gaussian at a dark page
+   edge. That moved a few rows of band fringe across the 0.55 / 0.004 density limits and flipped the band rule: top edge
+   72–87 px off on three `sidste` pages. An exact Gaussian fixed all crop boxes
+   to ±1 px but costs ~2.5 s per blur. The low-res exact Gaussian costs less than the box blur, but it first repeated a
+   3-row block average at the edge instead of the edge pixel (1 % off, still two flips). Replicating the edge pixels
+   *before* downsampling fixed that.
+2. **The port of the crop logic is exact; its inputs are not.** `axis_box` and the bash awk give the same result on the
+   same density profile (`flerspaltet` p1: 209/674 from both). Every remaining difference comes from a density one or two
+   levels of 255 apart sitting right on a limit (0.03, 0.004 after 8-bit quantisation, the 8 % window, the 10 % band
+   zone). Rendered vector pages (hayro vs poppler anti-aliasing) shift densities by a few levels, enough for a column at
+   0.029 vs 0.032.
+3. **Porting ImageMagick's `-resize` did not help.** A Lanczos port matched IM's 48-band profile better per pixel
+   (mean error 1.2 vs 2.3 grey levels, half the flips at 230), but on `skewed` p21 it tipped the "widest ink-free run" to
+   a run 243 px away. The area average stays within 5 px everywhere, so it stays.
+4. **Dithered 1-bit pages (#28):** poppler resamples a 3512-px 1-bit page to 3508 px with interpolation (12 % of its
+   pixels become grey), which turns the dithered band into grey that the flatten removes. Rust now blurs (σ 0.8) a
+   1-bit image **only when it has to be resampled**, and only for the output image. Measured on the blurred copy, the
+   band rule dropped `sidste` p4's last run and its page numbers 18/19. 1-bit pages at exact size (e.g. our own output
+   fed back) are untouched, so a 1-px line is never softened.
+5. **Skew estimator:** sum of squared counts plateaus for thick lines (1.925° found for 2°); near the true angle the bins
+   only change once a line end moves a whole pixel, so the search takes the middle of the best plateau and measures x
+   from the centre. On `skewed` it matches ImageMagick's `-deskew 40%` within 0.05° (IM reports the opposite sign):
+   p5 0.225/0.050 vs 0.224/0.028, p12 0.80/0.75 vs 0.81/0.70, p20 0.050/0.35 vs 0.028/0.34.
+
+### Pipeline order: A/B (the four questions)
+All variants on all scans against the same facts, same binary, knobs as env vars (`main.rs` header). Pages outside
+tolerance / total output size / `skewed` wall time (with Tesseract):
+
+| Variant | skewed | sidste | ryg | ren | fler | size | skewed time |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **base**: flatten once, analysis at 300 dpi, deskew per slot | 4 | 4 | 0 | 0 | 0 | 3 209 kB | 5.2 s |
+| `SLOTFLAT` (flatten each slot after cut/deskew, as bash) | 4 | 2 | 0 | 0 | 0 | 3 208 kB | 5.1 s |
+| `DESKEW_FIRST` (whole-page angle, straighten before measuring) | 4 | 4 | 0 | 0 | 0 | 3 209 kB | 5.7 s |
+| `INKGUTTER` (gutter from the 60 % ink map) | **46** | **16** | 0 | 0 | 0 | 3 210 kB | 5.3 s |
+| `ADPI=150` (analysis at 150 dpi) | 5 | **16** | **2** | 0 | 0 | 3 207 kB | 6.2 s |
+| `ADPI=100` | **46** | **16** | **2** | 0 | 0 | 3 206 kB | 5.3 s |
+
+1. **Flatten once on the full page: yes.** Same parity as per-slot flattening. The two `sidste` pages it "loses" are the
+   ones where it is cleaner than bash: the slot's clamped cut edge makes bash keep a spine line. Same time. It removes a
+   design wrinkle: analysis and output see the same flattened image, so the crop is measured on what is output.
+2. **Deskew before measuring: no.** No page changed. On `skewed`, 11 of 23 spreads have halves skewed > 0.5° apart,
+   mostly in **opposite directions** (p13: +1.38° / −1.15°, p11: +0.85° / −1.0°: the book fans open), so one
+   whole-spread angle cannot replace per-page deskew, and the gutter was found on 22/23 spreads without it. Skew here is
+   at most 1.4°. It would be worth it on scans with > 2° common skew where the gutter search fails.
+3. **Analysis at lower resolution: no.** It breaks parity (150 dpi: `ryg-side` = `sidste` p8 loses its page numbers,
+   bottom edge 192 px up, because the last text lines become a separate run in the bottom 10 % band zone; `skewed` p20
+   right edge 84 px in, `sidste` p4/p6 bottom 56/24 px; 100 dpi changes the canvas) and saves nothing: with the fast blur the whole pass A analysis is ~0.2 s/page CPU. The #28 question
+   ("reuse a low-dpi render?") is moot: get the page once at 300 dpi.
+4. **Threshold once: half.** One flatten serves analysis and output, and crop density uses its 60 % map. The gutter must
+   keep its lenient grey level: reading it off the 60 % map (dark = > 10 % ink in a band) moves gutters on every spread
+   (canvas changes, 62 pages out). The output threshold has to come after the deskew rotation (rotating a bitmap
+   loses thin strokes), so it is a second threshold by design. It is the cheap part anyway (the blur was the cost).
+
+### Speed and memory
+`skewed` (23 spreads, 300 dpi, M4, 10 threads): **5.2–5.9 s wall, 39 s CPU with `--rotate`**, of which Tesseract OSD is
+~1.3–1.5 s per page (pass A 4.0–4.5 s). **Without `--rotate`: 2.0 s wall, 15.5 s CPU** (0.67 s CPU per spread).
+Bash: 177 s wall, 638 s CPU. That is **30× wall / 16× CPU with OSD, 88× wall / 41× CPU for the image ops**. Per page
+in pass B: get 76 ms, cut + deskew + flatten + threshold + G4 of two slots ~380 ms. Peak RSS 1.2 GB (f32 buffers × 10
+threads); u8/u16 buffers or a thread cap would cut it, not done. The orientation step is now the bottleneck, which is #30.
+
+### Review: is this the right design?
+**Recommended order** (what the spike now does, base variant):
+get page at output dpi (extract or render) → orientation (quarter turn) → **flatten once** → ink map → crop box + gutter
+(full resolution) → document plan (medians, canvas) → per slot: cut from the flattened page → **deskew per slot** →
+centre on canvas → hysteresis threshold → G4.
+
+Prior art agrees on the main points: Scan Tailor Advanced's stages are Split Pages → Deskew → Select Content → Margins →
+Output, with illumination normalisation and binarisation only in Output (its README). So split before deskew,
+deskew per page, binarise last. unpaper's man page does not state a full order (filters apply before deskew, `--wipe`
+"after deskewing and before automatic border-scan"). The OCRmyPDF order in lessons.md stays unverified.
+
+**What a Rust design should drop or do differently from bash:**
+- Flatten three times (crop, gutter, slot) → once. Threshold three times → one analysis map + one output threshold.
+- Library compose semantics and per-page process spawning → gone (the 40× is mostly this plus the blur).
+- The integer median of a fraction (#40) → a real median.
+- Keep: two passes (document medians/canvas), analysis at output resolution, per-slot deskew, the lenient gutter level,
+  binarise last.
+
+**What should change next (heuristics, not the port).** The rules are full of hard cliffs: densities on 1/255 steps
+compared with 0.004 and 0.03, an 8 % window, a 10 % band zone, "widest run" between near-equal runs. Every remaining
+difference above is one of them tipping. A port cannot be more stable than its rules. Candidates, each to be measured
+on the suite:
+- The near-extension should require a small run (like the main block), not a single column at 2/255.
+- The band rule should require band-like evidence (full-width, or dense before flattening, see lessons idea 1), not
+  "any run in the outer 10 % behind a gap". It has now dropped text lines/page numbers twice in variants.
+- Choose the gutter by score (width × emptiness × closeness to the document median) instead of "widest run", so two
+  near-equal candidates don't flip.
+- Canvas = largest box still lets one bad page enlarge all (open in lessons).
+
+**Evidence that would change the recommendation:** scans with > 2° common skew where the gutter search fails
+(→ estimate a page angle first, then per-slot deskew as now); documents with hundreds of pages where RSS matters
+(→ u8 buffers, cache flattened pages or cap threads); a thin-stroke loss at other dpi (→ scale the blur and radius
+with dpi; bash uses 30 px regardless of dpi, the spike keeps that for parity).
+
+### Verdict for #29
+Image ops are cheap and exact enough in plain Rust: no image crate needed, same page counts, splits and sizes as bash on
+all real scans, 8 of 74 pages outside tolerance (all looked at: specks, one blank-page cliff, and three pages cleaner than
+bash), −0.2 … −4.2 % size, 41× less CPU for the image work. Tesseract OSD is now 75 % of the run time (#30).
