@@ -95,6 +95,10 @@ fi
 
 PAGES=$(pdfinfo "$IN" | awk '/^Pages:/ {print $2}')
 TMP=$(mktemp -d)
+# Divide_Dst/Divide_Src swapped meaning between ImageMagick versions (#22): pick the one that gives orig/blur (0.25/0.5 = 0.5).
+DIVIDE=Divide_Dst
+[ "$(magick xc:gray25 xc:gray50 -compose Divide_Dst -composite -format '%[fx:mean<0.7?1:0]' info:)" = 1 ] || DIVIDE=Divide_Src
+export DIVIDE
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/meta" "$TMP/plan"
 
@@ -129,7 +133,7 @@ ink_profile() {
   # Shave the top/bottom edge bands first: a dark scanner border running along an edge would
   # otherwise make every column count as ink and hide the gutter altogether.
   local shave; shave=$(awk -v h="$H" -v f="$GUTTER_EDGE_SHAVE" 'BEGIN{printf "%d", h*f}')
-  magick "$w" \( +clone -blur 0x30 \) -compose Divide_Dst -composite \
+  magick "$w" \( +clone -blur 0x30 \) -compose "$DIVIDE" -composite \
     -colorspace Gray -shave "0x$shave" -resize "${W}x${GRID_ROWS}!" -depth 8 txt:- | awk -v W="$W" -v T="$GUTTER_INK_THRESH" -v R="$GUTTER_MIN_INK_ROWS" '
     /^[0-9]+,[0-9]+:/ {
       split($0, parts, ":"); split(parts[1], xy, ","); x = xy[1] + 0
@@ -147,7 +151,7 @@ ink_profile() {
 content_box() {
   local w=$1 W=$2 H=$3
   local ink="$w.ink.png"
-  magick "$w" \( +clone -blur 0x30 \) -compose Divide_Dst -composite \
+  magick "$w" \( +clone -blur 0x30 \) -compose "$DIVIDE" -composite \
     -colorspace Gray -threshold 60% -negate "$ink" || return 1
   local prof
   for axis in cols rows; do
@@ -371,7 +375,7 @@ finish_slot() {
   # crop+threshold (text) or crop+jpeg (images) a single working file into its final slot
   local src=$1 dst_base=$2
   if [ "$MODE" = text ]; then
-    magick "$src" \( +clone -blur 0x30 \) -compose Divide_Dst -composite \
+    magick "$src" \( +clone -blur 0x30 \) -compose "$DIVIDE" -composite \
       -threshold "$THRESH%" -type bilevel -units PixelsPerInch -density "$DPI" \
       -compress Group4 "$dst_base.tif"
   else
