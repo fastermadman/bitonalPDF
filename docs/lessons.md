@@ -156,6 +156,22 @@ Details and numbers: `docs/rust-port.md` section 3. What generalises:
   of source only is a coincidence until a second kind confirms it.
 - A test set made by rotating pages with `rot90` and Tesseract-as-truth overstates accuracy (no real 90/180 scans, and Tesseract scores 100 % by construction).
 
+### 10. Measuring for mixed output (#43)
+Details and numbers: `docs/rust-port.md` section 4 (seven new scans with photos, diagrams, coloured text; findings in words and numbers only). What generalises:
+- **A detector validated on five documents fails on new material.** The own orientation detector (#30, 186/188 on the old suite) turned 12 of 77 upright pages
+  (photographed books with dark surrounds, picture and colour pages); Tesseract turned none. Its output also changed the split count on two files. Re-measure a heuristic on every new kind of source before it is
+  a baseline for something else.
+- **Split a signal by source before believing its separation.** Chroma is exactly 0 on 1-bit and grey pages (25 of 77 here), so "text-only pages" from those files make any colour signal look perfect;
+  component statistics change with the page encoding (JPEG noise makes tiny components). Report the RGB-only numbers next to the pooled ones. The scanner surround (dark table, a lamp glow) is not content and
+  lands in the "rest" class unless the eval works inside the crop box.
+- **Labels of soft classes need a written convention.** `diagram` vs `picture` (comic, map, engraving) and `coloured-text` (a typographic style on every page vs a coloured box) are judgement calls; flag them at
+  labelling time (19 of 77 pages) instead of hiding them, and drop tiles that straddle a box edge instead of guessing their class.
+- **Do not compare a viewer's render with the source when measuring codec loss.** Page geometry and resampling swamped it (17–30 dB for a lossless PNG); use the same viewer's render of the lossless variant as reference. And set the image
+  size explicitly when embedding (`img2pdf --imgsize 300dpi`): otherwise each format gets a different page size.
+- **ImageMagick 7.1.2 `compare -metric SSIM` prints 598…2300, not an SSIM;** the parenthesised value is (1 − SSIM)/2 (checked against an own implementation). Check a metric on a known pair before tabulating it.
+- **`MODE=images` can be bigger than the input** (a scan that is already a moderate JPEG: 1.47×); bash then reports "Not smaller" and writes nothing, so a baseline needs a scratch copy without that test to get the number.
+- `magick montage -label` gives nothing without a default font in this environment; pass `-font <file>`. Headless Chrome cannot screenshot a PDF here.
+
 ## Things that did not work or were misleading
 
 - `real.sh` says "ok" while the output is wrong. It only checks that a file is written, all pages have
