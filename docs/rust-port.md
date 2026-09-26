@@ -381,3 +381,293 @@ is the only reason to trust it beyond these 47 pages.
 Own detector as the default for `--rotate`: no system dependency, 186/188 on the local suite (misses: one ambiguous
 page), identical output to Tesseract on all six scans, 11× faster per page. The weak part is coverage of the test, not
 the numbers: five Latin documents and synthetic 90/180.
+
+## 4. B4 groundwork: material, baseline, codecs, signals (#43)
+
+Measurements for #38 (mixed output). **Data only: no thresholds, no rules, no design.** The seven PDFs are not open source
+and live git-ignored in `tests/real/new pdfs dont upload/`; nothing derived from their pixels is committed (no pages,
+crops, contact sheets), only numbers and words. Same machine as above (M4, 10 cores, release build). Numbering `f1…f7` =
+alphabetical order of the file names, which is also the order `*.pdf` expands to.
+
+Reproduce (all outputs land in the ignored folder):
+```
+cd rust && cargo build --release && cd ..
+D="tests/real/new pdfs dont upload"
+rust/target/release/bitonalpdf --detect-eval "$D"/*.pdf > det.tsv          # 6–7 s wall, byte-identical on a second run
+python3 tests/detect-join.py det.tsv "$D"                                  # joins with "$D"/<name>.labels, prints the signal tables
+python3 tests/codec-table.py crop.png ...                                  # codec table; --viewers crop.png for the viewer test
+```
+
+### 4.1 Inventory (task 1)
+77 pages, 7 files. TSV (per page: size, embedded image codec/colour space/ppi, gutter decision, label) is `work/inventory.tsv`
+in the ignored folder; summary:
+
+| # | What it is (owner's description was "photos, diagrams, a coloured cover") | pages | page size (pt, before `/Rotate`) | embedded images | gutter logic (`--split auto`) |
+|---|---|---:|---|---|---|
+| f1 | Religion textbook, photographed spreads, many full-page paintings/photos, comic, map, orange box | 25 | 728×1032, `/Rotate 90`, 300 ppi | 23 RGB JPEG, 2 JBIG2 (1-bit) | 22 spread, 2 single (full-bleed pictures), 1 double-shaped without gutter |
+| f2 | Journal book: coloured cover + 17 text pages, one small diagram | 18 | 842×595 A4, `/Rotate` | 5 RGB JPEG (cover + 4 text pages), 13 CCITT (1-bit) | 18 single (one book page per scan, the neighbour page shows as a sliver) |
+| f3 | Book chapter: coloured cover + 8 text pages | 9 | 596×842 (p1), 842×596 | p1 2 RGB JPEG, p2–9 grey JPEG + a thin second grey image (56–192 px wide strip) | p1 single, 8 spread |
+| f4 | Textbook chapter, blue/orange page tabs and headings | 5 | 728×1032, `/Rotate 90` | 3 RGB JPEG, 2 CCITT | 5 spread |
+| f5 | Magazine article: cover, diagrams, pie chart, photos, ad column, flatbed scan at 200 ppi, A4 portrait | 7 | 595×842 | 7 RGB JPEG | 7 single |
+| f6 | Excerpt, photographed A3 spreads on a dark table, one sepia picture | 4 | 1191×842 | 4 RGB JPEG, 300 ppi | 1 spread, **3 double-shaped with no confident gutter** (left unsplit by the rule, split by the document median) |
+| f7 | Textbook chapter, photographed spreads, jacket, orange headings, pale-green boxes, orange lamp glow at the bottom of every photo | 9 | 728×1032, `/Rotate 90` | 9 RGB JPEG | 1 single (jacket), 8 spread |
+
+Totals: 51 RGB JPEG pages, 15 CCITT, 8 grey JPEG (each with a strip image), 2 JBIG2, 1 RGB + RGB. The owner's description ("one coloured
+single-page cover, the rest double pages") fits f3 (cover p1, then 8 spreads); f2 has a cover but its other 17 pages are **single** book pages
+(each scan shows one page and a sliver of its neighbour), and f5 is a magazine of single A4 pages. Gutter calls overall:
+44 spread, 29 single, 4 double-shaped without a gutter. **Colour is not in every page:** 17 pages are 1-bit and 8 are grey,
+so any signal based on chroma is exactly 0 on 25 of 77 pages, whatever their content (see 4.5, RGB-only tables).
+
+### 4.2 Ground truth (task 2)
+Method: `pdftoppm -r 30` contact sheets to see the file, then every page at 50 dpi with a 10 % grid drawn over it, boxes
+read off the grid (good to about ±0.03 of the page, ≈ 90 px at 300 dpi; the sheets stay in the ignored folder).
+Files: `<name>.labels` next to each PDF (page, classes, certain 0/1, regions `class:x0,y0,x1,y1` as fractions of the
+rendered page, note). Convention: **only non-text regions are boxed**, everything else on the page is text/margin/
+surround; a page's class set contains every class that has a region, plus `text` when there is body text (captions
+alone do not count).
+
+| | pages having the class | regions boxed (uncertain) |
+|---|---:|---:|
+| text (body text) | 70 (41 text-only) | – |
+| picture (photo, painting, engraving) | 15 | 18 (6) |
+| diagram (flat colour / line art: comic, map, pie chart, box diagrams, QR code) | 10 | 12 (6) |
+| coloured-text | 13 | 12 (9) |
+| cover | 4 (f2 p1, f3 p1, f5 p1, f7 p1) | 4 (2) |
+| blank | 0 | – |
+
+100 % of the pages are labelled; 29 pages mix classes, 28 of them have region boxes (f7 p7 has only coloured headings and
+orange highlighted sentences inline, no block to box). **19 of 77 pages carry an uncertain label** (`certain=0`):
+f1 7 (pp. 1 comic, 2 pale-green box, 8 dark plate, 13 cartoon, 15 old map, 17 grey engraving, 19 orange box),
+f3 p1 (box edge of the cover), f4 p1, f5 p7, f6 p4 (sepia print) and f7 8 of 9 pages. What was hard:
+- **`diagram` vs `picture` is a judgement** for comics, an illustrated old map, an engraving and a colour cartoon. Nothing in the
+  brief defines the boundary; I called flat-colour drawings `diagram`, photographs and paintings `picture`, the grey engraving `picture`.
+- **`coloured-text` is a spectrum.** In f7 colour is a typographic style on every page (orange highlighted sentences, blue/orange
+  headings, pale-green boxes). Only block-sized regions are boxed; f7 p7 (and the inline colour on other f7 pages) is page-level
+  and uncertain. In f4 the page tabs and running heads are coloured but tiny; not boxed.
+- **Full-bleed pictures** (f1 pp. 8, 10, 12) run to the page edge and into the scanner surround; the box follows the picture, not the paper.
+- f1 p5 and p7 are one painting/picture pair across both pages of the spread, boxed as one region.
+- A QR code (f7 p8) is neither: boxed as `diagram`, uncertain.
+- A dark-blue page with white text (f7 p2, left) is called `coloured-text`, uncertain (it could be `cover`-like).
+- Boxes are ±0.03; tile labels (4.5) therefore skip tiles that are not ≥ 75 % inside one box.
+
+### 4.3 Baseline (task 3)
+All rows: **all four flags** `--rotate --crop --split auto --deskew`, 300 dpi (text) / 150 dpi (images, bash), threshold 60, one run each, machine
+otherwise idle. `text` = the Rust spike (own orientation detector, default), `text + Tess` = the spike with
+`BITONAL_OSD=tesseract` (see the orientation finding below; the corrected baseline), `images` = `MODE=images bitonalpdf.sh` with the same flags.
+Wall/CPU from `/usr/bin/time -l` (CPU = user + sys; bash: 4 pages at a time, includes Tesseract and ImageMagick children).
+"Sizes" = number of different output page sizes (1 = the `real.sh` check "all pages one size" holds); the page-count check
+is the output count against the number of spreads found, see the notes.
+
+| file | mode | pages in → out | in | out | out / in | sizes | wall | CPU | peak RSS |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|
+| f1 | text | 25 → 48 | 31.39 MB | 2.65 MB | 0.085 | 1 | 4.0 s | 29.8 s | 2048 MB |
+| f1 | text + Tess | 25 → 50 | | 2.67 MB | 0.085 | 1 | 8.4 s | 59.4 s | 1602 MB |
+| f1 | images | 25 → 50 | | 8.63 MB | 0.275 | 1 | 70.1 s | 250.9 s | 1796 MB |
+| f2 | text | 18 → 18 | 7.57 MB | 1.12 MB | 0.148 | 1 | 2.1 s | 16.6 s | 1353 MB |
+| f2 | text + Tess | 18 → 18 | | 1.12 MB | 0.148 | 1 | 4.3 s | 34.4 s | 1431 MB |
+| f2 | images | 18 → 18 | | 4.21 MB | 0.557 | 1 | 19.3 s | 68.9 s | 256 MB |
+| f3 | text | 9 → 17 | 1.44 MB | 0.54 MB | 0.376 | 1 | 0.9 s | 7.0 s | 1248 MB |
+| f3 | text + Tess | 9 → 17 | | 0.54 MB | 0.376 | 1 | 1.7 s | 13.5 s | 1019 MB |
+| f3 | images | 9 → 17 | | **2.12 MB (bash writes no file: "Not smaller")** | 1.472 | 1 | 17.0 s | 53.1 s | 300 MB |
+| f4 | text | 5 → 10 | 4.18 MB | 0.47 MB | 0.111 | 1 | 1.2 s | 5.1 s | 1261 MB |
+| f4 | text + Tess | 5 → 10 | | 0.47 MB | 0.111 | 1 | 2.5 s | 10.4 s | 873 MB |
+| f4 | images | 5 → 10 | | 1.61 MB | 0.386 | 1 | 17.3 s | 44.2 s | 142 MB |
+| f5 | text | 7 → 7 | 3.41 MB | 0.34 MB | 0.101 | 1 | 0.9 s | 5.1 s | 1318 MB |
+| f5 | text + Tess | 7 → 7 | | 0.34 MB | 0.101 | 1 | 1.6 s | 10.1 s | 1131 MB |
+| f5 | images | 7 → 7 | | 1.30 MB | 0.382 | 1 | 8.9 s | 31.7 s | 159 MB |
+| f6 | text | 4 → 8 | 1.83 MB | 0.38 MB | 0.208 | 1 | 1.3 s | 4.8 s | 1526 MB |
+| f6 | text + Tess | 4 → 8 | | 0.38 MB | 0.208 | 1 | 2.2 s | 8.5 s | 1245 MB |
+| f6 | images | 4 → 8 | | 1.42 MB | 0.778 | 1 | 13.9 s | 53.2 s | 292 MB |
+| f7 | text | 9 → 17 | 6.66 MB | 0.63 MB | 0.094 | 1 | 1.6 s | 11.2 s | 1836 MB |
+| f7 | text + Tess | 9 → 18 | | 0.63 MB | 0.094 | 1 | 2.7 s | 19.9 s | 2068 MB |
+| f7 | images | 9 → 18 | | 2.96 MB | 0.445 | 1 | 29.8 s | 91.7 s | 599 MB |
+
+Sums over the 7 files: input 56.5 MB; text 6.1 MB (0.11), images 22.3 MB (0.39); wall 12.0 s (text) vs 176 s (images), CPU 80 s vs 594 s
+(text with Tesseract OSD: 23.4 s wall, 156 s CPU). Every `real.sh`-style check holds (one page size in every output). The f3 images value
+comes from a scratch copy of `bitonalpdf.sh` with only the "not smaller" test removed (the pipeline itself is untouched); the real script writes nothing there.
+
+Things the table hides, each measured:
+1. **The own orientation detector (#30) is wrong on 12 of these 77 pages; Tesseract on none.** Truth = upright as read from the contact sheets
+   (no page is on its side or upside down); the detector turned f1 p5 and p22 by 270° (a picture spread and a JBIG2 page), f2 p10, p15, p16 by 180°,
+   f7 p1, p4, p5, p6, p7, p8 by 180° and f7 p2 by 90°. Tesseract returned 0° on all 77. Those 12 pages come out upside down or sideways in the `text` row above (seen
+   on the contact sheet of f7). It also changes the split decisions (f1 48 vs 50 pages, f7 17 vs 18), which is why the `text + Tess` rows are the ones to compare with `images`
+   (50 and 18 pages). So section 3's "186/188" was measured on five Latin documents rotated by `rot90`; on photographed pages with dark surroundings and on
+   picture/colour pages it does not hold. Not investigated why (unverified: dark surround, orange glow, large pictures counted as text lines).
+2. **Text mode destroys pictures, as expected:** f1's paintings and photos become black/white blotches, and some full-bleed picture pages come out nearly blank (seen on the contact
+   sheet of f1 output pages 9–16; unverified why: the flatten divides a uniform area by its own blur), coloured elements become grey on white. This is the case the mixed mode is for.
+3. **f6 (dark table, photographed A3): both modes split wrongly.** 3 of 4 spreads have no confident gutter; the median fallback cuts them, giving 8 pages, several of them
+   almost empty halves; a spine band remains in text mode; the deskew estimate on some slots hits the ±10° limit (10.14°, 9.78°). `f7` and `f1` show dark spine/edge bands in text mode too.
+   These are baseline flaws of the existing pipeline on this material, not of a mixed mode.
+4. **`MODE=images` can be larger than the input** (f3: 2.12 MB vs 1.44 MB, ratio 1.47; f6 0.78, f2 0.56): the input was already a moderately compressed JPEG.
+5. Peak memory of the spike is 0.9–2.1 GB (f32 buffers × 10 threads), bash images 0.14–1.8 GB.
+
+### 4.4 Codec table (task 4)
+Crops at 300 dpi cut from the rendered pages by the label boxes (8 crops, 2 per type, from 5 files; not committed): photo-a (f1 p20, 1289×880),
+photo-b (f5 p5, 1190×1332), diagram-a (f5 p4 pie chart, 1339×1332), diagram-b (f7 p2 circular word diagram, photographed, 1160×1122),
+coloured-text-a (f7 p3 pale-green box, 1031×910), coloured-text-b (f5 p2 coloured script heading, 1711×701), cover-a (f5 p1, 2480×3331), cover-b (f2 p1, 2281×2666).
+**Reference = the decoded crop, which is itself a scanner JPEG**, so all numbers are a second generation of loss. Cell = size / PSNR dB / SSIM.
+Encoders: ImageMagick 7.1.2 (JPEG 4:2:0 explicit, PNG level 9, PNG-8 = `-colors 256` with `/Indexed`), OpenJPEG 2.x `opj_compress` (`-r` = ratio to raw, so its size is
+about raw/ratio regardless of content), libwebp 1.6 `cwebp`, `avifenc -q 60 -s 6`. SSIM = 1 − 2 × the parenthesised value of `magick compare -metric SSIM`
+(checked against an own Gaussian-window SSIM: 0.9645 vs 0.9645; the first number ImageMagick prints is not SSIM). ∞ = identical.
+
+| setting | photo-a | photo-b | diagram-a | diagram-b | coloured-text-a | coloured-text-b | cover-a | cover-b |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| PNG lossless (Flate) | 1132 kB | 1159 kB | 936 kB | 925 kB | 879 kB | 537 kB | 6092 kB | 5981 kB |
+| JPEG q90 4:2:0 | 207 / 43.0 / 0.982 | 229 / 46.6 / 0.988 | 204 / 47.3 / 0.989 | 225 / 41.5 / 0.985 | 247 / 41.5 / 0.987 | 121 / 46.0 / 0.993 | 1244 / 45.8 / 0.988 | 1190 / 42.2 / 0.984 |
+| JPEG q75 4:2:0 | 119 / 39.4 / 0.965 | 130 / 43.3 / 0.977 | 113 / 43.8 / 0.978 | 134 / 38.0 / 0.972 | 159 / 36.7 / 0.972 | 77 / 42.5 / 0.988 | 720 / 42.2 / 0.977 | 724 / 38.9 / 0.969 |
+| JPEG q50 4:2:0 | 73 / 36.7 / 0.942 | 79 / 40.3 / 0.958 | 64 / 40.8 / 0.960 | 88 / 35.5 / 0.957 | 112 / 33.4 / 0.954 | 55 / 40.0 / 0.981 | 452 / 39.4 / 0.959 | 480 / 36.2 / 0.948 |
+| JPEG q75 4:4:4 | 139 / 40.2 / 0.967 | 147 / 44.0 / 0.978 | 129 / 44.5 / 0.979 | 167 / 40.2 / 0.979 | 166 / 36.7 / 0.972 | 94 / 43.5 / 0.989 | 810 / 43.1 / 0.979 | 875 / 40.6 / 0.975 |
+| PNG-8, 256 colours (Flate `/Indexed`) | 426 / 35.9 / 0.940 | 487 / 39.2 / 0.947 | 360 / 43.1 / 0.975 | 391 / 37.7 / 0.978 | 313 / 43.8 / 0.993 | 173 / 44.0 / 0.989 | 2675 / 37.8 / 0.930 | 2266 / 35.2 / 0.928 |
+| JPEG 2000 lossless | 749 / ∞ | 829 / ∞ | 655 / ∞ | 704 / ∞ | 580 / ∞ | 405 / ∞ | 4239 / ∞ | 3981 / ∞ |
+| JPEG 2000 ratio 10 | 340 / 48.4 / 0.992 | 475 / 52.6 / 0.997 | 535 / 60.0 / 0.999 | 390 / 50.2 / 0.996 | 281 / 47.1 / 0.994 | 360 / 62.7 / 1.000 | 2478 / 52.5 / 0.997 | 1824 / 48.1 / 0.995 |
+| JPEG 2000 ratio 30 | 113 / 41.1 / 0.966 | 158 / 45.0 / 0.981 | 178 / 47.1 / 0.987 | 130 / 41.4 / 0.978 | 94 / 34.9 / 0.961 | 120 / 48.6 / 0.995 | 826 / 44.6 / 0.982 | 608 / 39.9 / 0.970 |
+| WebP q90 | 143 / 42.3 / 0.976 | 133 / 44.1 / 0.979 | 117 / 44.7 / 0.980 | 152 / 41.8 / 0.985 | 183 / 42.4 / 0.989 | 65 / 45.3 / 0.992 | 715 / 43.8 / 0.979 | 847 / 42.1 / 0.983 |
+| WebP q75 | 59 / 37.8 / 0.946 | 53 / 40.1 / 0.951 | 40 / 40.8 / 0.956 | 72 / 37.5 / 0.968 | 102 / 37.1 / 0.975 | 33 / 40.8 / 0.984 | 298 / 39.9 / 0.956 | 426 / 37.2 / 0.955 |
+| WebP q50 | 40 / 36.1 / 0.930 | 35 / 38.6 / 0.937 | 24 / 39.5 / 0.945 | 53 / 35.7 / 0.960 | 77 / 35.0 / 0.968 | 25 / 39.1 / 0.981 | 202 / 38.4 / 0.945 | 308 / 35.2 / 0.932 |
+| WebP lossless | 791 / ∞ | 789 / ∞ | 635 / ∞ | 676 / ∞ | 539 / ∞ | 377 / ∞ | 4131 / ∞ | 4022 / ∞ |
+| AVIF q60 | 77 / 40.2 / 0.966 | 73 / 43.2 / 0.974 | 62 / 43.9 / 0.977 | 74 / 39.2 / 0.976 | 88 / 36.7 / 0.974 | 40 / 43.4 / 0.989 | 379 / 42.2 / 0.975 | 445 / 39.5 / 0.972 |
+
+(sizes in kB in the cells after the first row; encode time: JPEG 0.03–0.15 s, JPEG 2000 0.15–0.99 s, WebP 0.06–0.5 s (lossless 3 s on a cover), AVIF 0.1–0.6 s, PNG 1–12 s.)
+
+**Which viewers render which filter** (`tests/codec-table.py --viewers`: the crop embedded *without re-encoding* by `img2pdf --imgsize 300dpi`, rendered at 1:1, each render compared with
+the same viewer's render of the lossless Flate variant; run on photo-a and diagram-a, both gave the same picture):
+
+| PDF filter | poppler `pdftoppm` | Ghostscript | macOS PDFKit (`qlmanage`, the Preview/Quick Look renderer) | hayro (this spike, via `--detect-eval`) | Chrome / Firefox pdf.js |
+|---|---|---|---|---|---|
+| `DCTDecode` (JPEG) | ok | ok | ok | ok | not tested |
+| `FlateDecode` + PNG predictor (lossless) | ok, ∞ dB reference | ok | ok | ok | not tested |
+| `FlateDecode` `/Indexed` (PNG-8) | ok, 37.5 / 44.0 dB vs lossless (photo/diagram) | 35.9 / 43.1 | 38.3 / 45.1 | ok (same image size and statistics) | not tested |
+| `JPXDecode` (JPEG 2000, ratio 10) | ok, 49.6 / 60.2 dB | ok, 48.4 / 60.0 | ok, 49.9 / 60.9 | ok | not tested |
+| WebP, AVIF | **no PDF filter exists** (the spec has none), so there is nothing to embed or to test; only usable as a decoded-and-recompressed intermediate | | | | |
+
+The dB values equal the codec-only PSNR of the table within 1–2 dB, so all four renderers decode all four filters correctly. Chrome and Firefox could **not** be tried: headless Chrome
+(`--screenshot` on a PDF) produced no file here, the desktop app's browser pane shows local files as static snapshots without page tools, and Firefox is not installed. Preview itself was not run (qlmanage uses the same PDFKit renderer, unverified for the interactive app). So "≥ 3 viewers" = poppler, Ghostscript, PDFKit (+ hayro).
+
+### 4.5 Signal statistics (task 5)
+`--detect-eval a.pdf [b.pdf …]` renders every page at 300 dpi (colour needed, so the extract path is not used), computes the flatten + hysteresis ink map of the output path, and prints one TSV line per page and
+per 320 × 320 px tile (page 4299×3035 → 14×10 tiles; tiles less than half size at the border dropped): 77 page lines and 8 259 tile lines for the seven files, **6–7 s wall on 10 threads, byte-identical
+on a second run** (`cmp`). Eleven signals; the constants (chroma 20/60 of 255, mid-tones 0.2–0.8, 64 grey bins, edge |∇luma| > 0.2, "big" component ≥ 2000 px) are measurement settings, not rules:
+
+| signal | definition |
+|---|---|
+| `hasler` | Hasler–Süsstrunk colourfulness on 8-bit RGB: σ(rg, yb) + 0.3 μ(rg, yb) |
+| `nongrey20`, `nongrey60` | share of pixels with max(R,G,B) − min(R,G,B) ≥ 20 / ≥ 60 |
+| `lum_std` | standard deviation of Rec.601 luma (0–1) |
+| `midtone` | share of pixels with luma in 0.2–0.8 (grey-level histogram spread) |
+| `entropy` | Shannon entropy of the 64-bin luma histogram, bits |
+| `ink` | ink share after flatten + hysteresis (#20) |
+| `cc_per_mpx` | 8-connected ink components per megapixel (component counted in the tile holding its centroid) |
+| `cc_med_area` | median component area, px |
+| `cc_big_frac` | share of ink pixels lying in components ≥ 2000 px |
+| `edge` | share of pixels with central-difference gradient magnitude > 0.1 (luma 0–1) |
+
+`tests/detect-join.py` joins the TSV with the labels. Tile label = the region class covering ≥ 75 % of the tile; `rest` = no region touches it (text, margins, blank paper and the **scanner
+surround / dark table**); tiles partly inside a region are dropped (550 tiles). Counts: 424 picture, 100 diagram, 166 coloured-text, 289 cover, 6 730 rest tiles. Page label: the class is on the page, compared with the **41 pages
+that are body text only** (no picture/diagram/coloured region; from 5 files). Score per signal and class pair: **AUC** (direction-free, max(AUC, 1−AUC)) and **best-cut balanced accuracy** (the best single threshold, direction free; the cut itself is
+not reported: it would be a rule), then `[min–max per-file AUC, number of files with both classes]`. Cell = AUC / balanced accuracy.
+
+**Tiles, class vs rest**, all pages:
+
+| signal | picture vs rest | diagram vs rest | coloured-text vs rest | cover vs rest |
+|---|---:|---:|---:|---:|
+| n | 424 / 6730 | 100 / 6730 | 166 / 6730 | 289 / 6730 |
+| hasler | 0.97 / 0.91 [0.97–1.00, 3f] | 0.85 / 0.79 [0.77–0.95, 3f] | 0.91 / 0.86 [0.72–0.99, 4f] | 0.95 / 0.89 [0.81–1.00, 4f] |
+| nongrey20 | 0.94 / 0.91 [0.93–1.00, 3f] | 0.79 / 0.79 [0.66–0.91, 3f] | 0.80 / 0.79 [0.67–1.00, 4f] | 0.88 / 0.85 [0.68–1.00, 4f] |
+| nongrey60 | 0.90 / 0.89 [0.90–1.00, 3f] | 0.78 / 0.78 [0.63–0.95, 3f] | 0.77 / 0.76 [0.67–1.00, 4f] | 0.77 / 0.76 [0.67–1.00, 4f] |
+| lum_std | 0.55 / 0.57 [0.56–0.66, 3f] | 0.51 / 0.59 [0.52–0.67, 3f] | 0.55 / 0.64 [0.50–0.67, 4f] | 0.58 / 0.61 [0.58–0.75, 4f] |
+| midtone | 0.87 / 0.85 [0.55–0.97, 3f] | 0.76 / 0.70 [0.74–0.79, 3f] | 0.75 / 0.73 [0.75–0.93, 4f] | 0.85 / 0.81 [0.79–1.00, 4f] |
+| entropy | 0.96 / 0.88 [0.85–1.00, 3f] | 0.79 / 0.75 [0.71–0.88, 3f] | 0.83 / 0.80 [0.69–0.79, 4f] | 0.92 / 0.86 [0.79–0.99, 4f] |
+| ink | 0.73 / 0.71 [0.67–0.78, 3f] | 0.58 / 0.57 [0.60–0.89, 3f] | 0.52 / 0.59 [0.53–0.59, 4f] | 0.51 / 0.53 [0.56–0.65, 4f] |
+| cc_per_mpx | 0.82 / 0.81 [0.64–0.90, 3f] | 0.59 / 0.60 [0.67–0.91, 3f] | 0.67 / 0.66 [0.68–0.85, 4f] | 0.52 / 0.56 [0.58–0.68, 4f] |
+| cc_med_area | 0.67 / 0.79 [0.60–0.76, 3f] | 0.53 / 0.60 [0.57–0.70, 3f] | 0.55 / 0.66 [0.52–0.73, 4f] | 0.57 / 0.69 [0.52–0.77, 4f] |
+| cc_big_frac | 0.72 / 0.78 [0.66–0.84, 3f] | 0.67 / 0.74 [0.66–0.69, 3f] | 0.58 / 0.57 [0.52–0.69, 4f] | 0.61 / 0.63 [0.50–0.82, 4f] |
+| edge | 0.51 / 0.57 [0.52–0.64, 3f] | 0.63 / 0.62 [0.56–0.89, 3f] | 0.58 / 0.60 [0.58–0.70, 4f] | 0.66 / 0.68 [0.63–0.70, 4f] |
+
+(A pooled AUC can lie outside the per-file range because the direction is chosen per file: e.g. `entropy` for coloured text.)
+
+**Tiles, class pairs** (picture vs diagram n = 424/100, picture vs coloured-text 424/166, diagram vs coloured-text 100/166), all pages:
+
+| signal | picture vs diagram | picture vs coloured-text | diagram vs coloured-text |
+|---|---:|---:|---:|
+| hasler | 0.68 / 0.65 | 0.74 / 0.71 | 0.52 / 0.65 |
+| nongrey20 | 0.63 / 0.63 | 0.63 / 0.69 | 0.51 / 0.59 |
+| nongrey60 | 0.65 / 0.63 | 0.59 / 0.64 | 0.53 / 0.60 |
+| lum_std | 0.55 / 0.61 | 0.62 / 0.67 | 0.59 / 0.61 |
+| midtone | 0.65 / 0.71 | 0.66 / 0.75 | 0.50 / 0.58 |
+| entropy | 0.77 / 0.77 | 0.89 / 0.90 | 0.51 / 0.64 |
+| ink | 0.66 / 0.65 | 0.76 / 0.78 | 0.60 / 0.64 |
+| cc_per_mpx | 0.73 / 0.72 | 0.77 / 0.78 | 0.55 / 0.65 |
+| cc_med_area | 0.84 / 0.85 | 0.78 / 0.79 | 0.53 / 0.61 |
+| cc_big_frac | 0.71 / 0.75 | 0.82 / 0.85 | 0.78 / 0.81 |
+| edge | 0.64 / 0.63 | 0.60 / 0.63 | 0.54 / 0.61 |
+
+**Pages**, page has the class vs the 41 text-only pages (n = 15 picture, 10 diagram, 13 coloured-text, 4 cover):
+
+| signal | picture | diagram | coloured-text | cover |
+|---|---:|---:|---:|---:|
+| hasler | 0.98 / 0.97 | 0.95 / 0.90 | 0.97 / 0.94 | 1.00 / 1.00 |
+| nongrey20 | 0.98 / 0.95 | 0.96 / 0.93 | 0.97 / 0.94 | 1.00 / 1.00 |
+| nongrey60 | 0.99 / 0.97 | 0.88 / 0.90 | 0.95 / 0.96 | 1.00 / 1.00 |
+| lum_std | 0.50 / 0.66 | 0.54 / 0.66 | 0.54 / 0.67 | 0.66 / 0.74 |
+| midtone | 0.91 / 0.90 | 0.74 / 0.72 | 0.65 / 0.72 | 0.98 / 0.96 |
+| entropy | 0.95 / 0.89 | 0.84 / 0.80 | 0.86 / 0.81 | 1.00 / 1.00 |
+| ink | 0.53 / 0.64 | 0.78 / 0.75 | 0.79 / 0.75 | 0.55 / 0.68 |
+| cc_per_mpx | 0.53 / 0.71 | 0.74 / 0.75 | 0.67 / 0.72 | 0.70 / 0.74 |
+| cc_med_area | 0.57 / 0.76 | 0.50 / 0.71 | 0.57 / 0.72 | 0.59 / 0.79 |
+| cc_big_frac | 0.73 / 0.74 | 0.61 / 0.75 | 0.56 / 0.68 | 0.87 / 0.85 |
+| edge | 0.69 / 0.71 | 0.83 / 0.84 | 0.84 / 0.82 | 0.98 / 0.99 |
+
+**The same restricted to pages whose source has colour** (RGB JPEG pages only, 16 text-only pages instead of 41; tiles: rest n = 4 414). Nothing on a 1-bit or grey page can carry chroma, so the all-pages
+numbers above are partly a measurement of the source encoding (25 of 77 pages):
+
+| signal | tiles: picture vs rest | tiles: coloured-text vs rest | pages: picture vs text-only | pages: diagram vs text-only | pages: coloured-text vs text-only |
+|---|---:|---:|---:|---:|---:|
+| hasler | 0.95 / 0.90 | 0.86 / 0.79 | 0.96 / 0.97 | 0.86 / 0.90 | 0.92 / 0.92 |
+| nongrey20 | 0.93 / 0.90 | 0.78 / 0.77 | 0.95 / 0.94 | 0.89 / 0.90 | 0.92 / 0.92 |
+| nongrey60 | 0.90 / 0.88 | 0.77 / 0.75 | 0.98 / 0.97 | 0.86 / 0.90 | 0.94 / 0.96 |
+| midtone | 0.82 / 0.81 | 0.68 / 0.67 | 0.80 / 0.84 | 0.55 / 0.65 | 0.73 / 0.81 |
+| entropy | 0.93 / 0.86 | 0.75 / 0.75 | 0.86 / 0.81 | 0.59 / 0.71 | 0.64 / 0.71 |
+| ink | 0.77 / 0.74 | 0.51 / 0.57 | 0.88 / 0.87 | 0.64 / 0.70 | 0.66 / 0.69 |
+| cc_per_mpx | 0.88 / 0.84 | 0.73 / 0.70 | 0.93 / 0.93 | 0.53 / 0.64 | 0.66 / 0.73 |
+| cc_med_area | 0.70 / 0.79 | 0.56 / 0.66 | 0.97 / 0.97 | 0.85 / 0.85 | 0.96 / 0.92 |
+| cc_big_frac | 0.70 / 0.77 | 0.58 / 0.58 | 0.95 / 0.90 | 0.90 / 0.92 | 0.82 / 0.80 |
+| edge | 0.55 / 0.59 | 0.60 / 0.63 | 0.52 / 0.61 | 0.79 / 0.81 | 0.76 / 0.72 |
+
+Page level, picture vs diagram (13/6 pages) and picture vs coloured-text (13/7 pages), only-that-class pages: best AUC `cc_per_mpx` 0.86 / 0.89, `entropy` 0.87 / 0.84,
+`cc_med_area` 0.86 / 0.88, `midtone` 0.82 / 0.98, `cc_big_frac` 0.77 / 0.95 (full table: `python3 tests/detect-join.py`).
+
+Observations (numbers, not rules; small n):
+- **Picture vs text/rest is separated by colour signals** (`hasler` 0.97 tiles, 0.98 pages; 0.95 / 0.96 on RGB pages only) and by `entropy`; luma spread and edge density barely separate it on tiles (0.51–0.55).
+  A photographed *black-and-white* page would not be caught by colour; the grey engraving (f1 p17) is in the picture class and the only grey picture.
+- **Diagram and coloured text are close to each other** (AUC 0.50–0.55 on all signals except `lum_std` and `ink` 0.59–0.60 and `cc_big_frac` 0.78). Diagram vs text-only pages is best by colour (0.95) and `edge` (0.83).
+- **Picture vs diagram** is best separated by median component size (0.84 tiles, 0.86 pages) and `entropy`, not by colour (0.63–0.68) — which is a statement about how I drew the border (4.2), with only 100 diagram tiles from 4 files.
+- **The signals lean on the source.** All-pages tile AUC for coloured text vs rest drops 0.91 → 0.86 for `hasler` when 1-bit/grey pages are removed, `cc_med_area` for page-level picture vs text-only rises 0.57 → 0.97 (a
+  colour-scan artefact: JPEG noise on RGB text pages makes many tiny components, 1-bit pages do not), i.e. `cc_*` values depend on the encoding of the page, not only on the content.
+- **Scanner surround counts as `rest`.** f1, f4, f6, f7 are photographed on dark tables; f7 has an orange lamp glow on every page. Those tiles have colour or extreme luma and are labelled `rest`. That makes the
+  colour numbers *pessimistic* for picture vs rest on those files; a signal computed inside the crop box would look better. Not measured here (would need the crop from pass A in this eval).
+- **Per-file spread is large for the weak signals** (e.g. `entropy` coloured-text vs rest 0.69–0.79 per file, 0.83 pooled; diagram vs coloured-text `lum_std` 0.55–0.99): with 3–4 files per class pair, that is a property of the files.
+
+### 4.6 What did not work, what is missing
+Did not work / cost time:
+- `magick montage -label` produced nothing readable (no default font found here); sheets in tile order instead, a grid drawn with an explicit font path (`/System/Library/Fonts/Helvetica.ttc`) for the box reading.
+- `stat` on the symlinks I used for short names gave 63 B input sizes in the first baseline run (fixed from the real files; the bash "not smaller" test itself follows the link).
+- `magick compare -metric SSIM` on ImageMagick 7.1.2 prints a number that is *not* SSIM (598 … 2300 for JPEG q90 … q50); the parenthesised value is (1−SSIM)/2 (4.4).
+- First viewer test compared each render with the source crop: PSNR 17–30 dB even for a lossless PNG, because page geometry/resampling dominates; the same viewer's lossless render as reference gave codec-only numbers.
+- `img2pdf` without `--imgsize 300dpi` sets page sizes from image metadata that differ per format (508×347 vs 4029×2750 px at 300 dpi), which made the first render comparison meaningless.
+- Headless Chrome screenshots of a PDF produced no file; the app's browser pane cannot be driven on local PDF files (4.4).
+- The per-signal thresholds at the best cut are optimistic by construction (chosen on the data they are scored on, no hold-out; leave-one-file-out was not done, the per-file AUC ranges are the only check).
+
+Still missing (for #38 / later):
+- **A picture-heavy public-domain source.** All seven files are the owner's; a book with figures under a clear licence is still needed for anything that is committed (tests, fixtures).
+- **Vector/rendered pages with figures.** All 77 pages are scans; the second source kind of section 3's warning (rendered text) is not covered by this label set. Text-only vector pages exist locally
+  (`ren-side`, `flerspaltet`) but carry no picture/diagram labels.
+- Labels are by one person (me), boxes ±0.03 of a page, 19 pages uncertain; no second labeller.
+- Signals were computed on the whole page image including the surround and on the 300-dpi render; per-region signals inside the crop box, a grey-scale-only source, and colour signals at lower resolution were not measured.
+- `blank` has zero examples; no blank pages exist in this material.
+- Error cost (picture treated as text vs the reverse) is not measured here; the baseline gives the two extremes (text mode: pictures destroyed, ~0.11 of input; images mode: ~0.39 of input, 1.47 on f3).
+
+### 4.7 Observations for #38 (not proposals)
+- Output/input is 0.085–0.38 for text and 0.28–1.47 for images; the images output is 3.3–4.7× the text output on every file (f1 3.3×, f2 3.8×, f3 3.9×, f4 3.4×, f5 3.8×, f6 3.7×, f7 4.7×).
+- Chroma signals are cheap and separate colour pictures from body text well on colour scans; they say nothing on 1-bit/grey pages (25 of 77 here), where the tool has no colour to keep anyway.
+- The hard pairs are diagram vs coloured text and picture vs diagram; the labels for those are the least certain.
+- Detection would also have to survive the pipeline's own weak spots seen in 4.3: wrong orientation (12 pages), wrong splits on the dark-table photographs (f6), and the flatten blanking full-bleed pictures.

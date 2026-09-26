@@ -8,6 +8,7 @@
 //   BITONAL_DESKEW_FIRST=1  estimate the skew on the whole page and straighten it before measuring crop/gutter
 //   BITONAL_INKGUTTER=1     gutter profile from the 60 % ink map instead of the lenient grey level (threshold once)
 //   BITONAL_OSD=tesseract   orientation by Tesseract OSD (as bash) instead of the own detector (#30); --osd-eval prints its accuracy
+// --detect-eval a.pdf [b.pdf ...] prints candidate picture/colour signals per page and tile as TSV (#43, docs/rust-port.md section 4).
 use hayro::hayro_interpret::font::Glyph;
 use hayro::hayro_interpret::hayro_syntax::Pdf;
 use hayro::hayro_interpret::hayro_syntax::page::Page;
@@ -129,11 +130,13 @@ fn main() {
     };
     let mut pos = vec![];
     let mut eval = false;
+    let mut detect = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--rotate" => cfg.rotate = true,
             "--osd-eval" => eval = true,
+            "--detect-eval" => detect = true,
             "--crop" => cfg.crop = true,
             "--deskew" => cfg.deskew = true,
             "--split" => {
@@ -149,6 +152,9 @@ fn main() {
             s if s.starts_with("--") => die(&format!("{s}: unknown option")),
             _ => pos.push(a.clone()),
         }
+    }
+    if detect {
+        return detect_eval(&pos);
     }
     let input = pos.first().unwrap_or_else(|| die("usage: bitonalpdf [--rotate] [--crop] [--split auto|off|N%] [--deskew] input.pdf [output.pdf] [threshold%] [dpi]"));
     let output = pos.get(1).cloned().unwrap_or_else(|| format!("{}.1bit.pdf", input.trim_end_matches(".pdf")));
@@ -929,6 +935,145 @@ fn osd_eval(data: &Arc<Vec<u8>>, n: usize) {
         }).collect::<Vec<_>>()
     });
     rows.into_iter().flatten().for_each(|l| println!("{l}"));
+}
+
+/// #43 measurement, no rules: candidate picture-vs-text signals for every page and every DET_TILE square of it, one
+/// TSV line each, for any number of PDFs. The page is always rendered (colour is needed); the ink map is the
+/// flatten + hysteresis map of the output path. Join with the labels outside (docs/rust-port.md section 4).
+const DET_TILE: usize = 320;
+const DET_SIGNALS: [&str; 11] =
+    ["hasler", "nongrey20", "nongrey60", "lum_std", "midtone", "entropy", "ink", "cc_per_mpx", "cc_med_area", "cc_big_frac", "edge"];
+
+fn detect_eval(files: &[String]) {
+    println!("#file\tpage\tscope\tx0\ty0\tx1\ty1\tW\tH\t{}", DET_SIGNALS.join("\t"));
+    for f in files {
+        let data = Arc::new(std::fs::read(f).unwrap_or_else(|e| die(&format!("{f}: {e}"))));
+        let n = Pdf::new(data.clone()).unwrap_or_else(|e| die(&format!("{f}: {e:?}"))).pages().len();
+        let name = std::path::Path::new(f).file_name().map_or(f.clone(), |s| s.to_string_lossy().into_owned());
+        for l in par_pages(&data, n, detect_page).into_iter().flatten() {
+            println!("{name}\t{l}");
+        }
+    }
+}
+
+fn detect_page(page: &Page, i: usize) -> Vec<String> {
+    let (pw, ph) = page.render_dimensions();
+    let s = 300.0f32 / 72.0;
+    let (w, h) = ((pw * s).ceil() as usize, (ph * s).ceil() as usize);
+    let rs = RenderSettings { x_scale: s, y_scale: s, width: Some(w as u16), height: Some(h as u16), bg_color: WHITE };
+    let pix = render(page, &RenderCache::new(), &InterpreterSettings::default(), &rs);
+    let rgb: Vec<[u8; 3]> = pix.data().iter().map(|p| [p.r, p.g, p.b]).collect();
+    let lum: Vec<f32> = rgb.iter().map(|p| (p[0] as f32 * 0.299 + p[1] as f32 * 0.587 + p[2] as f32 * 0.114) / 255.0).collect();
+    let img = Img { w, h, px: lum };
+    let ink = hyst(&flatten(&img, BLUR_SIGMA), 60.0);
+    let (lab, comps) = components(&ink, w, h);
+    let lum = &img.px;
+
+    let sig = |x0: usize, y0: usize, x1: usize, y1: usize| -> String {
+        let (mut n, mut rg, mut rg2, mut yb, mut yb2, mut ng20, mut ng60) = (0f64, 0f64, 0f64, 0f64, 0f64, 0f64, 0f64);
+        let (mut l1, mut l2, mut mid, mut edge, mut inks, mut big) = (0f64, 0f64, 0f64, 0f64, 0f64, 0f64);
+        let mut hist = [0f64; 64];
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let k = y * w + x;
+                let [r, g, b] = rgb[k].map(|v| v as f64);
+                let (d1, d2) = (r - g, 0.5 * (r + g) - b);
+                let c = r.max(g).max(b) - r.min(g).min(b);
+                n += 1.0;
+                (rg, rg2, yb, yb2) = (rg + d1, rg2 + d1 * d1, yb + d2, yb2 + d2 * d2);
+                ng20 += (c >= 20.0) as u8 as f64;
+                ng60 += (c >= 60.0) as u8 as f64;
+                let l = lum[k] as f64;
+                (l1, l2) = (l1 + l, l2 + l * l);
+                mid += (0.2..=0.8).contains(&l) as u8 as f64;
+                hist[((l * 64.0) as usize).min(63)] += 1.0;
+                if ink[k] {
+                    inks += 1.0;
+                    big += (comps[lab[k] as usize].0 >= 2000) as u8 as f64;
+                }
+                if x > 0 && y > 0 && x + 1 < w && y + 1 < h {
+                    let (gx, gy) = ((lum[k + 1] - lum[k - 1]) as f64, (lum[k + w] - lum[k - w]) as f64);
+                    edge += (gx * gx + gy * gy > 0.04) as u8 as f64;
+                }
+            }
+        }
+        let (mrg, myb) = (rg / n, yb / n);
+        let hasler = ((rg2 / n - mrg * mrg).max(0.0) + (yb2 / n - myb * myb).max(0.0)).sqrt() + 0.3 * (mrg * mrg + myb * myb).sqrt();
+        let entropy: f64 = hist.iter().filter(|&&c| c > 0.0).map(|&c| -(c / n) * (c / n).log2()).sum();
+        let mut areas: Vec<u32> = comps
+            .iter()
+            .filter(|c| c.0 > 0 && (c.1 / c.0 as f64) >= x0 as f64 && (c.1 / c.0 as f64) < x1 as f64 && (c.2 / c.0 as f64) >= y0 as f64 && (c.2 / c.0 as f64) < y1 as f64)
+            .map(|c| c.0)
+            .collect();
+        areas.sort_unstable();
+        let med = areas.get(areas.len() / 2).copied().unwrap_or(0);
+        let v = [
+            hasler, ng20 / n, ng60 / n, (l2 / n - (l1 / n).powi(2)).max(0.0).sqrt(), mid / n, entropy, inks / n,
+            areas.len() as f64 / (n / 1e6), med as f64, big / inks.max(1.0), edge / n,
+        ];
+        format!("{x0}\t{y0}\t{x1}\t{y1}\t{w}\t{h}\t{}", v.iter().map(|x| format!("{x:.4}")).collect::<Vec<_>>().join("\t"))
+    };
+
+    let mut out = vec![format!("{}\tpage\t{}", i + 1, sig(0, 0, w, h))];
+    for y in (0..h).step_by(DET_TILE) {
+        for x in (0..w).step_by(DET_TILE) {
+            let (x1, y1) = ((x + DET_TILE).min(w), (y + DET_TILE).min(h));
+            if x1 - x >= DET_TILE / 2 && y1 - y >= DET_TILE / 2 {
+                out.push(format!("{}\ttile\t{}", i + 1, sig(x, y, x1, y1)));
+            }
+        }
+    }
+    out
+}
+
+/// 8-connected components of `ink`: the root label of every ink pixel, and per root (area, sum x, sum y); area 0 = not a root.
+fn components(ink: &[bool], w: usize, h: usize) -> (Vec<u32>, Vec<(u32, f64, f64)>) {
+    fn find(p: &mut [u32], mut a: u32) -> u32 {
+        while p[a as usize] != a {
+            p[a as usize] = p[p[a as usize] as usize];
+            a = p[a as usize];
+        }
+        a
+    }
+    let mut lab = vec![0u32; w * h];
+    let mut parent: Vec<u32> = vec![];
+    for y in 0..h {
+        for x in 0..w {
+            if !ink[y * w + x] {
+                continue;
+            }
+            let mut near = [u32::MAX; 4];
+            let nb = [(x > 0, y * w + x.wrapping_sub(1)), (x > 0 && y > 0, (y.wrapping_sub(1)) * w + x.wrapping_sub(1)), (y > 0, y.wrapping_sub(1) * w + x), (y > 0 && x + 1 < w, y.wrapping_sub(1) * w + x + 1)];
+            for (j, (ok, k)) in nb.iter().enumerate() {
+                if *ok && ink[*k] {
+                    near[j] = find(&mut parent, lab[*k]);
+                }
+            }
+            let m = near.iter().copied().min().unwrap();
+            let l = if m == u32::MAX {
+                parent.push(parent.len() as u32);
+                parent.len() as u32 - 1
+            } else {
+                for &o in near.iter().filter(|&&o| o != u32::MAX) {
+                    parent[o as usize] = m;
+                }
+                m
+            };
+            lab[y * w + x] = l;
+        }
+    }
+    let mut comps = vec![(0u32, 0f64, 0f64); parent.len()];
+    for y in 0..h {
+        for x in 0..w {
+            if ink[y * w + x] {
+                let r = find(&mut parent, lab[y * w + x]);
+                lab[y * w + x] = r;
+                let c = &mut comps[r as usize];
+                *c = (c.0 + 1, c.1 + x as f64, c.2 + y as f64);
+            }
+        }
+    }
+    (lab, comps)
 }
 
 /// Gaussian blur, edges clamped. A sigma-30 blur is smooth, so it is computed on a copy downsampled by k (area
