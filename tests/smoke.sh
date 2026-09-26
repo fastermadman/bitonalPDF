@@ -36,4 +36,12 @@ magick "$T/pn.png" -compress none -units PixelsPerInch -density 150 "$T/pn.pdf"
 [ -f "$T/pn.out.pdf" ] || { cat "$T/pn.log" >&2; echo "FAIL: no page-number output" >&2; exit 1; }
 h=$(pdfinfo "$T/pn.out.pdf" | awk '/^Page +size:/ {print $5}')
 awk -v h="$h" 'BEGIN{exit !(h*150/72 >= 1050)}' || { echo "FAIL: page number cropped off (height $h pt)" >&2; exit 1; }
+# --crop must ignore a thin dark stripe (scanner edge / spine shadow) far from the text block:
+# a 4px-wide, 600px-tall bar at x=40 must not pull the crop's left edge out to it (block starts at x=150).
+magick -size 1240x1754 xc:white "$T/blk.png" -geometry +150+150 -composite -fill gray15 -draw "rectangle 40,300 43,900" "$T/bar.png"
+magick "$T/bar.png" -compress none -units PixelsPerInch -density 150 "$T/bar.pdf"
+./bitonalpdf.sh --crop "$T/bar.pdf" "$T/bar.out.pdf" >"$T/bar.log" 2>&1 || true
+[ -f "$T/bar.out.pdf" ] || { cat "$T/bar.log" >&2; echo "FAIL: no stripe output" >&2; exit 1; }
+w=$(pdfinfo "$T/bar.out.pdf" | awk '/^Page +size:/ {print $3}')
+awk -v w="$w" 'BEGIN{exit !(w*150/72 < 640)}' || { echo "FAIL: stripe widened the crop (width $w pt)" >&2; exit 1; }
 echo "smoke ok"
