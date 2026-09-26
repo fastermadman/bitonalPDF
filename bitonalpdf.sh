@@ -41,6 +41,8 @@ GUTTER_VALLEY_RATIO=0.5       # fallback when no ink-free gap exists (text touch
 GRID_ROWS=48                  # rows sampled when building the per-column ink profile
 CROP_MIN_DENSITY=0.03         # a row/column needs at least this ink fraction to count as content...
 CROP_MAX_DENSITY=0.55         # ...and at most this (near-solid rows/columns are scanner borders)
+CROP_NEAR_DENSITY=0.004       # sparse ink (page numbers, running heads) this close to the text block is kept: weaker than MIN_DENSITY, but only within CROP_NEAR_FRAC
+CROP_NEAR_FRAC=0.08           # how far (fraction of page size) beyond the text block sparse ink is searched for
 CROP_EDGE_FRAC=0.015          # ignore the outer band of each edge (fraction of page size)
 CROP_PAD_FRAC=0.012           # margin kept around the detected text block
 
@@ -93,6 +95,10 @@ fi
 
 PAGES=$(pdfinfo "$IN" | awk '/^Pages:/ {print $2}')
 TMP=$(mktemp -d)
+# Divide_Dst/Divide_Src swapped meaning between ImageMagick versions (#22): pick the one that gives orig/blur (0.25/0.5 = 0.5).
+DIVIDE=Divide_Dst
+[ "$(magick xc:gray25 xc:gray50 -compose Divide_Dst -composite -format '%[fx:mean<0.7?1:0]' info:)" = 1 ] || DIVIDE=Divide_Src
+export DIVIDE
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/meta" "$TMP/plan"
 
@@ -127,7 +133,7 @@ ink_profile() {
   # Shave the top/bottom edge bands first: a dark scanner border running along an edge would
   # otherwise make every column count as ink and hide the gutter altogether.
   local shave; shave=$(awk -v h="$H" -v f="$GUTTER_EDGE_SHAVE" 'BEGIN{printf "%d", h*f}')
-  magick "$w" \( +clone -blur 0x30 \) -compose Divide_Dst -composite \
+  magick "$w" \( +clone -blur 0x30 \) -compose "$DIVIDE" -composite \
     -colorspace Gray -shave "0x$shave" -resize "${W}x${GRID_ROWS}!" -depth 8 txt:- | awk -v W="$W" -v T="$GUTTER_INK_THRESH" -v R="$GUTTER_MIN_INK_ROWS" '
     /^[0-9]+,[0-9]+:/ {
       split($0, parts, ":"); split(parts[1], xy, ","); x = xy[1] + 0
@@ -145,7 +151,7 @@ ink_profile() {
 content_box() {
   local w=$1 W=$2 H=$3
   local ink="$w.ink.png"
-  magick "$w" \( +clone -blur 0x30 \) -compose Divide_Dst -composite \
+  magick "$w" \( +clone -blur 0x30 \) -compose "$DIVIDE" -composite \
     -colorspace Gray -threshold 60% -negate "$ink" || return 1
   local prof
   for axis in cols rows; do
@@ -153,12 +159,17 @@ content_box() {
     if [ "$axis" = cols ]; then prof=$(magick "$ink" -colorspace Gray -scale "${W}x1!" -depth 8 gray:- | od -An -v -tu1)
     else prof=$(magick "$ink" -colorspace Gray -scale "1x${H}!" -depth 8 gray:- | od -An -v -tu1); fi
     printf '%s\n' "$prof" | awk -v N="$([ "$axis" = cols ] && echo "$W" || echo "$H")" \
-      -v lo="$CROP_MIN_DENSITY" -v hi="$CROP_MAX_DENSITY" -v edge="$CROP_EDGE_FRAC" -v pad="$CROP_PAD_FRAC" '
-      { for (k = 1; k <= NF; k++) { i = n++; d = $k / 255
+      -v lo="$CROP_MIN_DENSITY" -v hi="$CROP_MAX_DENSITY" -v edge="$CROP_EDGE_FRAC" -v pad="$CROP_PAD_FRAC" -v nlo="$CROP_NEAR_DENSITY" -v near="$CROP_NEAR_FRAC" '
+      { for (k = 1; k <= NF; k++) { i = n++; d = $k / 255; dens[i] = d
           if (d >= lo && d <= hi) { if (first == "" && i >= edge * N) first = i
                                     if (i <= N - 1 - edge * N && i > last) last = i } } }
       END {
         if (first == "") { first = 0; last = N - 1 }
+        else {  # extend to sparse ink near the block; the speck filter still decides where the block is
+          f0 = first; l0 = last
+          for (i = f0 - 1; i >= f0 - near * N && i >= edge * N; i--) if (dens[i] >= nlo && dens[i] <= hi) first = i
+          for (i = l0 + 1; i <= l0 + near * N && i <= N - 1 - edge * N; i++) if (dens[i] >= nlo && dens[i] <= hi) last = i
+        }
         first = int(first - pad * N); last = int(last + pad * N)
         if (first < 0) first = 0; if (last > N - 1) last = N - 1
         print first, last - first + 1 }' > "$w.$axis"
@@ -262,7 +273,7 @@ export -f render rotate_page ink_profile content_box measure_geometry passA
 export IN TMP MODE DPI ROTATE CROP SPLIT_MODE SPLIT_FIXED
 export OSD_MIN_CONFIDENCE DOUBLE_AR_MIN GUTTER_INK_THRESH GUTTER_SEARCH_LO GUTTER_SEARCH_HI
 export GUTTER_MIN_WIDTH_FRAC GUTTER_MAX_WIDTH_FRAC GUTTER_MIN_INK_FRAC GRID_ROWS
-export GUTTER_VALLEY_RATIO GUTTER_EDGE_SHAVE GUTTER_MIN_INK_ROWS GUTTER_TRUST_FRAC CROP_MIN_DENSITY CROP_MAX_DENSITY CROP_EDGE_FRAC CROP_PAD_FRAC
+export GUTTER_VALLEY_RATIO GUTTER_EDGE_SHAVE GUTTER_MIN_INK_ROWS GUTTER_TRUST_FRAC CROP_MIN_DENSITY CROP_NEAR_DENSITY CROP_NEAR_FRAC CROP_MAX_DENSITY CROP_EDGE_FRAC CROP_PAD_FRAC
 
 echo "Pass 1/2: rendering + measuring $PAGES pages (4 at a time, MODE=$MODE)..."
 seq 1 "$PAGES" | xargs -P 4 -I{} bash -c 'passA {}'
@@ -364,7 +375,7 @@ finish_slot() {
   # crop+threshold (text) or crop+jpeg (images) a single working file into its final slot
   local src=$1 dst_base=$2
   if [ "$MODE" = text ]; then
-    magick "$src" \( +clone -blur 0x30 \) -compose Divide_Dst -composite \
+    magick "$src" \( +clone -blur 0x30 \) -compose "$DIVIDE" -composite \
       -threshold "$THRESH%" -type bilevel -units PixelsPerInch -density "$DPI" \
       -compress Group4 "$dst_base.tif"
   else
