@@ -56,5 +56,5 @@ run pagenumber 0 "$T/pn.pdf"     'H*150/72 >= 1050'                             
 run stripe     0 "$T/bar.pdf"    'W*150/72 < 640'                                 --crop               # #23: thin stripe far from the text does not widen the crop
 run wide-table 0 "$T/wide.pdf"   'n == 1'                                         --crop --split auto  # a table wider than tall, no gutter: never split
 run flatten    0 "$T/flat.pdf"   'ink > 0.005'                                                         # #22: thin ink on grey paper must survive flattening
-run dark-band  1 "$T/band.pdf"   'y0 >= 8'                                         --crop               # #23 open: a wide dark band at the top must not stay in the crop (ink box must not touch the top edge)
+run dark-band  0 "$T/band.pdf"   'y0 >= 8'                                         --crop               # #23: a wide dark band at the top must not stay in the crop (ink box must not touch the top edge)
 exit $bad

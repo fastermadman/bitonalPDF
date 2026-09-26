@@ -25,7 +25,7 @@ Reference scans (local only) and the results `tests/real.sh` expects:
 | Page numbers survive crop | Works on all six real scans (#19/#21) |
 | Thin stray stripes no longer widen the crop | Works on `skewed` (#23/#24) |
 | Newer ImageMagick | Works since #22 (before: silently wrong) |
-| Wide dark bands / striped edge (`sidste side …`) | **Not fixed** (#23 still open) |
+| Wide dark bands / striped edge (`sidste side …`) | Works (#23): bands gone on the contact sheet, page numbers kept |
 | Thin strokes lose ink at the hard 60 % threshold | **Not started** (#20) |
 | Speed | **Slow**: ~5 min for 23 pp on an M-series Mac (#8/#9, the reason for the Rust port) |
 
@@ -77,6 +77,18 @@ if no run is wide enough. **Works** on `skewed` (bars on output pages 21/27 gone
 **Not fixed:** `sidste side …` still has dark bands at the top of a few pages and a striped left edge;
 these are wide, so the run rule does not touch them (open in #23).
 
+### 6b. Wide dark bands (#23)
+Rule: a wide run lying entirely within the outer `CROP_BAND_FRAC` (10 %) of the page and cut off from the next run
+by a gap is a scanner band and is dropped; sparse-ink extension and padding may not grow back into it. Columns are
+now profiled *inside the row range* (rows first, densities scaled by ht/H so `CROP_MAX_DENSITY` keeps its meaning),
+otherwise the band's columns widened the box. Lessons: (1) the flatten (divide by blur) removes the *interior* of a
+big dark band, only a fringe survives as ink, so "starts at the edge" tests fail: test that the run lies *inside* the
+edge zone; (2) the near-extension and the pad silently re-admitted the band, both needed a limit; (3) shell state does
+not persist between tool calls, export the tunables when testing `content_box` by hand.
+Effect on `sidste side …`: canvas 485x591 -> 389x581 pt (bands no longer enlarge it), page numbers kept. Also
+changed sizes slightly on `skewed`, `ryg-side`, `flerspaltet`, `ren-side` (checked by eye, page numbers present).
+**Known risk:** a running head lying alone in the top 10 % behind a gap is dropped like a band.
+
 ### 7. A yardstick that says more than "ok" (#27)
 `tests/measure.sh file.pdf` prints per output page: size in pt, the ink bounding box in per-mille of the
 page, and whether there is ink in the bottom 12 % (footer/page number). Two consumers:
@@ -96,7 +108,7 @@ Measured (each case shown to fail on pre-fix code, same fixtures):
 | `stripe` (#23) | `0d2b7a7` | FAIL (Mac and CI) | PASS |
 | `flatten` (#22) | `7fa02c2`, ImageMagick 7.1.2-31 (CI) | FAIL, output page blank | PASS |
 | `flatten` (#22) | `7fa02c2`, ImageMagick 7.1.2-24 (Mac) | passes (the bug does not exist there) | PASS |
-| `dark-band` (#23, open) | any | KNOWN-FAIL: ink box touches the top edge | KNOWN-FAIL |
+| `dark-band` (#23) | any before the fix | KNOWN-FAIL: ink box touches the top edge | PASS |
 
 Durations: `synth.sh` ~84 s on CI (ubuntu; `smoke.sh` 54 s there), ~81 s on the Mac (`smoke.sh` 46 s). The
 real-scan run took 4 min 49 s on the Mac when compared against the facts (`skewed` 151 s; all six pass, so the facts are reproducible), 10.5 min the first time while other jobs ran.
