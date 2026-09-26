@@ -25,8 +25,9 @@ jobs:
         env:
           HOMEBREW_NO_AUTO_UPDATE: 1
           HOMEBREW_NO_INSTALL_CLEANUP: 1
-      - run: shellcheck -e SC1090,SC2153 bitonalpdf.sh build.sh tests/smoke.sh tests/real.sh
+      - run: shellcheck -e SC1090,SC2153 bitonalpdf.sh build.sh tests/smoke.sh tests/real.sh tests/synth.sh tests/measure.sh
       - run: tests/smoke.sh
+      - run: tests/synth.sh
 
   build:
     runs-on: macos-latest

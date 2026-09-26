@@ -77,6 +77,35 @@ if no run is wide enough. **Works** on `skewed` (bars on output pages 21/27 gone
 **Not fixed:** `sidste side …` still has dark bands at the top of a few pages and a striped left edge;
 these are wide, so the run rule does not touch them (open in #23).
 
+### 7. A yardstick that says more than "ok" (#27)
+`tests/measure.sh file.pdf` prints per output page: size in pt, the ink bounding box in per-mille of the
+page, and whether there is ink in the bottom 12 % (footer/page number). Two consumers:
+- `tests/real.sh` compares that against `tests/real/<name>.facts` (git-ignored): size exact, box ±20 ‰
+  (`FACT_TOL`), footer flag equal, page count equal. `--record` writes them (do it only after looking at
+  `out/`), `ONLY=<name>` runs one scan, `BIN=<script>` runs another implementation. A changed fact fails:
+  flipping the footer flag of `ryg-side` page 1 gave `FAIL facts differ: page 1: footer ink 1 (expected 0)`.
+- `tests/synth.sh` builds fixtures from rectangles/speckle (no fonts), runs `BIN` (default `bitonalpdf.sh`),
+  measures, prints one row per case: PASS / FAIL / KNOWN-FAIL / XPASS (XPASS fails the run so a fixed
+  defect gets moved out of the known list). It runs in CI after `smoke.sh`.
+
+Measured (each case shown to fail on pre-fix code, same fixtures):
+
+| Case | Pre-fix code | Result there | Current `main` |
+|---|---|---|---|
+| `pagenumber` (#19) | `7fa02c2` | FAIL (Mac and CI) | PASS |
+| `stripe` (#23) | `0d2b7a7` | FAIL (Mac and CI) | PASS |
+| `flatten` (#22) | `7fa02c2`, ImageMagick 7.1.2-31 (CI) | FAIL, output page blank | PASS |
+| `flatten` (#22) | `7fa02c2`, ImageMagick 7.1.2-24 (Mac) | passes (the bug does not exist there) | PASS |
+| `dark-band` (#23, open) | any | KNOWN-FAIL: ink box touches the top edge | KNOWN-FAIL |
+
+Durations: `synth.sh` ~84 s on CI (ubuntu; `smoke.sh` 54 s there), ~81 s on the Mac (`smoke.sh` 46 s). The
+real-scan run took 4 min 49 s on the Mac when compared against the facts (`skewed` 151 s; all six pass, so the facts are reproducible), 10.5 min the first time while other jobs ran.
+The real scans' recorded facts confirm the known defect: `sidste side …` pages 7, 8, 11 and 12 have an ink box
+touching the top edge (11 also full width) (the dark bands, #23), and page 1 is blank (the blank facing page).
+Pitfalls found: the pre-fix `7fa02c2` on ImageMagick -31 also "passes" `stripe`/`dark-band` because its
+flatten is broken (blank page), so read a pre-fix row only for the case it is meant to prove; `-format '%w %h'`
+without `\n` makes `read` fail under `set -e`; `magick … -format %@` warns on an all-white page.
+
 ## Things that did not work or were misleading
 
 - `real.sh` says "ok" while the output is wrong. It only checks that a file is written, all pages have
@@ -148,7 +177,7 @@ these are wide, so the run rule does not touch them (open in #23).
 
 ## Notes for the Rust port (#8/#9)
 
-- Golden fixtures: the six local scans plus the smoke synthetics. Compare page counts, page size and
+- Golden fixtures: the six local scans (`.facts` files) plus `tests/synth.sh`; plug the binary in with `BIN=`. Compare page counts, page size and
   the *per-axis content boxes*, not just "no crash".
 - Re-implement the flatten (divide by a blurred copy) explicitly; do not inherit a library's compose enum.
 - Port the density/run/near-extension logic as written above; the constants are the tuning state.
