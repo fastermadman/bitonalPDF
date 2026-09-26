@@ -87,6 +87,10 @@ esac
 IN=${1:?missing input.pdf. usage: $0 [--rotate] [--crop] [--split auto|off|N%] [--deskew] input.pdf [output.pdf] [threshold%] [dpi]}
 OUT=${2:-"${IN%.pdf}.$SUFFIX.pdf"}
 THRESH=${3:-60}
+WEAK_THRESH=${WEAK_THRESH:-75}   # weaker ink level kept next to strong ink (#20); <= THRESH turns hysteresis off
+HYST_RADIUS=${HYST_RADIUS:-2}
+SEED_THRESH=${SEED_THRESH:-45}
+[ "$WEAK_THRESH" -gt "$THRESH" ] || WEAK_THRESH=$THRESH
 DPI=${4:-$DEFAULT_DPI}
 PROGRESS_FILE=${PROGRESS_FILE:-/dev/null}
 [ "$OUT" != "$IN" ] || { echo "output must differ from input" >&2; exit 1; }
@@ -396,9 +400,14 @@ finish_slot() {
   # crop+threshold (text) or crop+jpeg (images) a single working file into its final slot
   local src=$1 dst_base=$2
   if [ "$MODE" = text ]; then
-    magick "$src" \( +clone -blur 0x30 \) -compose "$DIVIDE" -composite \
-      -threshold "$THRESH%" -type bilevel -units PixelsPerInch -density "$DPI" \
-      -compress Group4 "$dst_base.tif"
+    # hysteresis (#20): everything darker than THRESH is ink; weaker pixels (up to WEAK_THRESH, thin strokes) are
+    # added only within HYST_RADIUS px of a *seed* (darker than SEED_THRESH), so fringes near the threshold stay white
+    magick "$src" \( +clone -blur 0x30 \) -compose "$DIVIDE" -composite -write mpr:flat +delete \
+      \( mpr:flat -threshold "$WEAK_THRESH%" \
+         \( mpr:flat -threshold "$SEED_THRESH%" -negate -morphology Dilate "Disk:$HYST_RADIUS" -negate \) \
+         -compose Lighten -composite \) \
+      \( mpr:flat -threshold "$THRESH%" \) -compose Darken -composite \
+      -type bilevel -units PixelsPerInch -density "$DPI" -compress Group4 "$dst_base.tif"
   else
     magick "$src" -quality 65 -units PixelsPerInch -density "$DPI" "$dst_base.jpg"
   fi
@@ -440,7 +449,7 @@ passB() {
   echo "$n" >> "$PROGRESS_FILE"
 }
 export -f finish_slot passB
-export THRESH PROGRESS_FILE DESKEW TW TH
+export THRESH WEAK_THRESH HYST_RADIUS SEED_THRESH DIVIDE PROGRESS_FILE DESKEW TW TH
 
 echo "Pass 2/2: cropping/splitting/deskewing + MODE=$MODE finishing..."
 seq 1 "$PAGES" | xargs -P 4 -I{} bash -c 'passB {}'

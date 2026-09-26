@@ -26,7 +26,7 @@ Reference scans (local only) and the results `tests/real.sh` expects:
 | Thin stray stripes no longer widen the crop | Works on `skewed` (#23/#24) |
 | Newer ImageMagick | Works since #22 (before: silently wrong) |
 | Wide dark bands / striped edge (`sidste side …`) | Works (#23): bands gone on the contact sheet, page numbers kept |
-| Thin strokes lose ink at the hard 60 % threshold | Measured, **not changed** (#20): a higher global threshold also darkens scanner-edge fringes |
+| Thin strokes lose ink at the hard 60 % threshold | Works (#20): hysteresis, 60 % + weak pixels up to 75 % next to a seed < 45 % |
 | Speed | **Slow**: ~5 min for 23 pp on an M-series Mac (#8/#9, the reason for the Rust port) |
 
 ## Problems, causes, fixes
@@ -89,15 +89,19 @@ Effect on `sidste side …`: canvas 485x591 -> 389x581 pt (bands no longer enlar
 changed sizes slightly on `skewed`, `ryg-side`, `flerspaltet`, `ren-side` (checked by eye, page numbers present).
 **Known risk:** a running head lying alone in the top 10 % behind a gap is dropped like a band.
 
-### 6c. A higher final threshold (#20)
-A/B on `skewed` p5 (300 dpi, flatten then threshold): black fraction / G4 size at 60 % 7.1 % / 89.4 kB, 70 % 7.9 % /
-89.4 kB, 75 % 8.3 % / 89.7 kB; `-level 20%,90%` or sigmoidal ≈ 60 %; `-lat` 40x40-8% 8.9 % / 91.5 kB (+2 %, more noise);
-render 600 dpi → 300 → t60 6.9 % (worse). On a clean page (`ren-side`) 60/70/75 look the same. On thin scans 75 helps most
-(broken serifs and `tol.e` closed). **But** as the *default* it fails the real facts: at 70 the `dark-band` synth case and
-`skewed` p1 get ink at the box edge; at 65 `sidste side …` p11/p12 get a dark line along the bottom edge (fringe of the
-scanner border that the flatten leaves at 60–65 % grey). Reverted, default stays 60. Users of thin scans can pass 70–75 as
-argument 3. **Idea for the port:** relax the threshold only inside the text box / away from the page edge (or hysteresis:
-strong ink at 60 %, weaker pixels kept only when connected to it), not a global level.
+### 6c. Thin strokes: hysteresis instead of a higher threshold (#20)
+A/B on `skewed` p5 (300 dpi, after flatten): black fraction / G4 size at 60 % 7.1 % / 89.4 kB, 70 % 7.9 %, 75 % 8.3 % /
+89.7 kB; `-level`/sigmoidal ≈ 60 %; `-lat` 8.9 % / 91.5 kB (+2 %, noisier); render 600 dpi → 300 → t60 6.9 %. On a clean
+page 60/70/75 look the same; on thin scans 75 closes broken serifs and dots best.
+A higher *global* threshold fails the facts, because the scanner-edge fringe sits near 60-65 % grey: at 70 the `dark-band`
+synth case and `skewed` p1 get ink at the box edge, at 65 `sidste side …` p11/12 get a dark line along the bottom.
+Plain hysteresis with seeds at 60 % also failed: the fringe has a few pixels just under 60 that act as seeds.
+**What works:** ink = darker than 60 % (unchanged) **plus** pixels up to `WEAK_THRESH` (75 %) that lie within
+`HYST_RADIUS` (2 px) of a *seed* darker than `SEED_THRESH` (45 %). Black fraction on `skewed` p5 8.2 %, size 89.3 kB (no
+growth); synth all PASS, `skewed`/`ryg-side`/`ren-side`/`flerspaltet` facts unchanged; `sidste side …` p9 (top, 40→18 ‰) and
+p11 (left/right edge) get faint dotted marks in the margin, viewed and judged harmless: text is clearly better, no bands.
+Facts of `sidste side …` re-recorded. Env `WEAK_THRESH`/`HYST_RADIUS`/`SEED_THRESH` tune it; `WEAK_THRESH<=THRESH` turns it off.
+Port note: implement as a per-pixel rule (dark < 0.60, or dark < 0.75 and a pixel < 0.45 within 2 px), not via a morphology call.
 
 ### 7. A yardstick that says more than "ok" (#27)
 `tests/measure.sh file.pdf` prints per output page: size in pt, the ink bounding box in per-mille of the
