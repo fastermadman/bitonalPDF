@@ -4,15 +4,23 @@ Living log of the `--rotate/--crop/--split/--deskew` pipeline in `bitonalpdf.sh`
 **measured** results only; anything guessed is marked *(unverified)*. Real scans are copyrighted and
 stay in the git-ignored `tests/real/`; findings about them are written down here instead.
 
-Reference scans (local only): `skewed` (23 pp, 16 MB, skewed double pages), `sidste side helt til margin`
-(8 pp, 4.8 MB, borders), `flerspaltet på nær første side` (9 pp, multi-column, must never split),
-`ryg-side` (1 p, page numbers close to the text), `ren-side` and `ren pdf` (clean, ~no-op).
+Reference scans (local only) and the results `tests/real.sh` expects:
+
+| File | What it is | Expected |
+|---|---|---|
+| `skewed` | skewed double pages, 23 pp, 16 MB (the "Otzen" scan in #3) | 23 → 46 pp, ~5 min |
+| `sidste side helt til margin` | borders, blank facing page, 8 pp, 4.8 MB (the "Lundager" scan in #3) | 8 → 16 pp |
+| `flerspaltet på nær første side` | multi-column article, must never be split | 9 → 9 pp |
+| `ryg-side` | one spread, text right up to the spine, page numbers 26/27 | 1 → 2 pp |
+| `ren-side`, `ren pdf` | clean, should be (nearly) a no-op | `ren pdf`: not smaller, no file written, counts as ok |
+
+(The Otzen/Lundager ↔ file-name mapping is inferred from page counts and sizes in #3.)
 
 ## Status at a glance
 
 | Area | State |
 |---|---|
-| Rotate (Tesseract OSD), split, deskew | Works on both first real scans: skewed 23 → 46 pp, Lundager 8 → 16 pp, no false splits (#3) |
+| Rotate (Tesseract OSD), split, deskew | Works on the real scans: skewed 23 → 46 pp, sidste side 8 → 16 pp, no false splits; multi-column and clean files behave (#3) |
 | Crop: text block, no scanner borders, uniform page size | Works (#7) |
 | Page numbers survive crop | Works on all six real scans (#19/#21) |
 | Thin stray stripes no longer widen the crop | Works on `skewed` (#23/#24) |
@@ -39,7 +47,9 @@ document-median fallback. Fixes: shave the top/bottom 3 % before profiling; a gu
 ### 3. Text touching the spine: no ink-free gap (#3/#17)
 Fallback: deepest dip of the smoothed column-ink profile, accepted only if below
 `GUTTER_VALLEY_RATIO` (0.5) of the density on both sides, and only reached when the strict search
-finds nothing. Added in #17; its effect on the real scans was not separately measured *(unverified)*.
+finds nothing. Measured: `ryg-side` (text to the spine) went from "looks double, no confident gutter, left
+unsplit" to 1 → 2 pages, cut checked visually; the other real scans are unaffected (#3, closing comment).
+Ideas not yet tried for this case are in "Ideas from #8" below.
 
 ### 4. Page numbers cut off (#19/#21)
 Cause: a page-number line is a few digits, density far below the 3 % speck filter, so the crop ended
@@ -82,6 +92,53 @@ these are wide, so the run rule does not touch them (open in #23).
 - `pdfinfo` `Page size: W x H pts`: awk fields are `$3` = width, `$5` = height (twice wrong in smoke tests).
 - A regression test must be shown to **fail without the fix**; two of ours passed vacuously first.
 - Don't run `real.sh` and `smoke.sh` at once, and don't `git stash` the script while a run uses it.
+
+## Open defects and decisions
+
+- **Canvas = largest text block.** One stray mark can enlarge every page. Idea: a percentile instead of
+  the max, with clipping guarded so text is never cut (#3 handover). Any widening of the crop (as in #19)
+  must keep this in mind.
+- **Small black marks / a thin vertical bar** on some `skewed` pages (#3): the thin bar is addressed by #24;
+  small isolated marks were not re-checked separately.
+- **Fixtures.** Three archive.org candidates (`sim_solicitors-journal_1866-09-08_10`,
+  `sim_unitarian-register…_1842-10-01_21_40`, `pappenheimersnov00asht_1`) were checked by cover thumbnail
+  and are single portrait pages, not spreads: useless for split tests. Still needed: real *spread*
+  scans with clear rights (`licenseurl`/CC0/public domain); 2–4 page excerpts could then live in the repo.
+- **A real scan is in git history.** `tests/real/lundager.pdf` was committed by accident in #11 and removed
+  in #12, but stays in history. The repo is public; decision so far: accepted. `tests/real/` is git-ignored.
+- **Synthetic fixture suite.** An old deleted branch (`claude/practical-heisenberg-o8cfcu`, last commit
+  `b3bd6ac`, reachable by SHA only for a while) had `tests/generate_fixtures.py` + runner. Too heavy for
+  the bash CI (#11, #14) but a good parity suite for the port: run bash and Rust on the same generated
+  fixtures and compare (#9).
+- **Original design choices (#1).** Order matters: rotate → crop → split → deskew → flatten/threshold. The
+  first idea (crop symmetric around the gutter, then cut at 50 %) was replaced by cropping to the real
+  content bounds and splitting at the detected gutter (#2). Multi-column pages are never split by default.
+  `--ocr` (hidden text layer) is out on purpose: it does not help the markdown-extraction pipeline, only
+  reading the PDF itself.
+
+## Ideas to test (from #8, unverified: from web search/descriptions, not source-read)
+
+1. **Spine-shadow signal.** Scan Tailor Advanced reportedly combines text evidence with a separate
+   spine-darkness search; we only use ink columns of a background-flattened page, and flattening divides
+   the shadow away. A per-column mean grey level *before* flattening is a cheap second signal
+   (relevant for `ryg-side`).
+2. **Order of operations.** OCRmyPDF: rotate → remove background → deskew → clean. We find the gutter
+   before deskew, so a skewed spine smears the column profile. Test: deskew (or estimate the angle) first.
+3. **Binarise first?** Hypothesis: smaller/faster to profile, but thresholding may erase the shadow or turn
+   it into a solid band that reads as ink. Measure the shadow on grey first, then A/B.
+4. **Rust candidates to spike:** `lopdf` (read/write, no render), `hayro` (pure-Rust render),
+   `pdfium-render` (needs Pdfium), `ocr`/`ocrcer` crates (claim deskew, Sauvola, auto-rotate, columns).
+   No Rust project found doing spread + border + spine in one tool.
+5. **Reading list (prior art is GPL: learn the ideas, do not copy code unless our licence allows):**
+   Scan Tailor Advanced (`filters/page_split/PageLayoutEstimator.cpp`, spine-darkness search, content-box
+   finder), unpaper (border/black-edge detection, deskew), OCRmyPDF (step order).
+6. #19 (page numbers), #20 (thresholding) and #23 (dark edges) should be regression cases for the port.
+
+## Working tips
+
+- `shellcheck` is not installed locally (`brew install shellcheck`); CI runs it.
+- macOS `sed -i` needs a backup argument; use python for scripted edits.
+- `tests/real.sh` takes ~8–10 min in total (`skewed` is the slow one).
 
 ## Not tried yet
 
