@@ -2,7 +2,7 @@
 
 Spike code: `rust/` (one file, `src/main.rs`). Build: `cd rust && cargo build --release`; the binary takes the
 `bitonalpdf.sh` CLI, so `BIN=rust/target/release/bitonalpdf tests/synth.sh` works. Text mode only (no `MODE=images`).
-Since #29 it does `--rotate` (Tesseract, as in bash), `--crop`, `--split auto|off|N%` and `--deskew`.
+Since #29 it does `--rotate` (Tesseract, as in bash; since #30 an own detector by default, section 3), `--crop`, `--split auto|off|N%` and `--deskew`.
 `BITONAL_TIMING=1` prints per-page geometry and stage times, `BITONAL_RENDER=1` forces the render path; the A/B knobs of
 section 2 are listed at the top of `main.rs`.
 
@@ -280,3 +280,104 @@ with dpi; bash uses 30 px regardless of dpi, the spike keeps that for parity).
 Image ops are cheap and exact enough in plain Rust: no image crate needed, same page counts, splits and sizes as bash on
 all real scans, 8 of 74 pages outside tolerance (all looked at: specks, one blank-page cliff, and three pages cleaner than
 bash), −0.2 … −4.2 % size, 41× less CPU for the image work. Tesseract OSD is now 75 % of the run time (#30).
+
+## 3. Orientation without Tesseract (#30)
+
+### Result
+`--rotate` in the spike now uses its own detector (`osd_own` in `main.rs`, ~60 lines, no new crate, no system
+dependency). `BITONAL_OSD=tesseract` brings back the old Tesseract call (kept as a fallback and for the comparison
+below). On the six local scans the output PDFs are **byte-identical** with both detectors (`cmp`), so the parity of
+section 2 (`BIN=… SIZE_TOL=3 tests/real.sh`: same 4 + 4 pages outside tolerance on `skewed`/`sidste`, same `skewed.facts`
+mismatch from #40) is unchanged. `cargo test` has `orientation_found_for_all_turns` (synthetic lines with ascenders and
+descenders, all four turns; shown to fail with the direction sign flipped).
+
+### How it works
+Both stages look at a flattened darkness map (1 − flatten, the #29 flatten) of a downsampled copy, in `tile × tile`
+squares (equal sample count for rows and columns), central 90 % of the page only (scanner borders).
+1. **Axis (0/180 vs 90/270).** Text lines make row profiles sharper than column profiles: score = Σ(Δ profile)² / Σ profile²
+   summed over all tiles, rows vs columns. Done at **1/8 size (37 dpi)**, tile 48 px.
+2. **Direction (0 vs 180, 90 vs 270).** Per tile profile along the text axis, cut into lines at local minima of the
+   smoothed profile. Per line, take the rows ≥ 50 % of the line's peak as the x-height band; **ink above the band
+   (ascenders, capitals, digits) minus ink below it (descenders)**, normalised. Positive = upright. At **1/4 size (75 dpi)**.
+3. Confidence = axis ratio × |direction score|; below 0.25 the page is left as it is (like Tesseract's confidence < 1).
+
+### Accuracy
+Test set: every page of the six local files (47 pages, `ren pdf` has 5), first turned upright by Tesseract, then
+rotated with `rot90` by 0/90/180/270 → **188 cases**, expected answer = the inverse turn. `bitonalpdf --osd-eval file.pdf`
+prints one line per case (`EVAL_TESS=1` adds Tesseract's answer and time).
+
+| Detector | correct | notes |
+|---|---:|---|
+| **own (default: k 8/4, tile 48)** | **186 / 188** (98.9 %) | 0 wrong axis, 2 wrong direction, both on `ren pdf` p2 (below) |
+| own, direction at 1/2 size | 188 / 188 | (see the grid; no reason to pay for it) |
+| Tesseract | 188 / 188 | **by construction** (it defines "upright"), so this only shows it is rotation-consistent |
+
+Per file, own default: `skewed` 92/92, `sidste side` 32/32, `flerspaltet` 36/36, `ryg-side` 4/4, `ren-side` 4/4, `ren pdf` 18/20.
+The 23 + 8 + 1 pages that Tesseract reads as 270° (scanned spreads lying on their side) are found as 270°. The local
+suite has 0 and 270 as real cases; 90 and 180 exist only as pixel-exact `rot90` copies. That is a weaker test than a
+real scan fed upside down (no scanner/feeder asymmetry, no second resampling), **so 98.9 % is an upper bound**.
+
+The two misses: `ren pdf` p2 is a portrait page with a caption line on top and a wide table lying sideways below it.
+The content is mixed; Tesseract follows the caption (0°), the detector follows the (much larger) table and turns it
+90°. Either answer is defensible, and the "truth" here is Tesseract's. Confidence 0.12 / 0.23; the 0.25 gate would have
+returned 0 for both (right for one of them), but the gate was set after seeing these numbers, so it is not validated.
+
+### Time
+Per detection, all pages in parallel on 10 threads (so both are measured under the same load): **own 102 ms, Tesseract
+1 126 ms** (11×; own includes two flattens and the downsampling). Whole runs, all four flags, wall clock:
+
+| Scan | pages | own | Tesseract | (no `--rotate`, #29) |
+|---|---:|---:|---:|---:|
+| skewed | 23 | 2.31 s | 5.09 s | 2.0 s |
+| sidste side | 8 | 0.96 s | 2.42 s | |
+| flerspaltet | 9 | 0.80 s | 1.60 s | |
+| ryg-side | 1 | 0.55 s | 1.40 s | |
+| ren-side | 1 | 0.34 s | 0.69 s | |
+
+So orientation now costs ~0.3 s on `skewed` instead of ~3 s, and the 30× (with OSD) of section 2 becomes ~75× against bash.
+
+### What did not work (in the order tried)
+All numbers: the same 168 cases (without `ren pdf`), before the final design.
+1. **Row vs column sharpness on the 60 % ink map at 100 dpi, whole-page profiles:** 83 / 168. 43 wrong axis (skewed
+   spreads: two halves skewed differently smear a page-wide row profile) and 42 wrong direction.
+2. **Same in 8 vertical strips:** 43 / 168, *worse*: a short strip has a noisier column profile, and noise counts as sharpness.
+3. **Square tiles (fixes the noise bias), ink map:** 70 / 168. A thin stroke averaged to 1/3 size is grey, mostly above
+   the 0.6 line, so the ink map lost the text. **Using the flattened darkness itself instead of a threshold:** 99 / 168.
+4. **Lower resolution for the axis** is what fixed it: at 1/8 size the axis was right in 168/168 (1/6 with tile 64: 4 wrong;
+   1/4 with tile 96: 27 wrong). At 100 dpi the glyph stems make the column profile as "sharp" as the line structure;
+   at 37 dpi only the lines survive.
+5. **Direction from "steps down outweigh steps up"** (baseline crisper than the x-height top): right on every scan
+   (`skewed`, `sidste`, `ryg`, `ren`), **inverted on `flerspaltet`** (rendered vector text): 26–34 of 36 wrong at every
+   resolution from 1/2 to 1/8. Why was not investigated *(unverified: crisp vector edges make both edges equally sharp)*.
+   That it worked on the scans might be a property of scanned edges rather than of the letters, so it was dropped.
+   The ascender/descender feature is right on all of them from 1/4 size (at 1/8: 166/168).
+6. **Sensitivity of the final design** (correct of 188, `BITONAL_OSDKA/KD/TILE`):
+
+| axis 1/k, direction 1/k, tile | correct | | axis, dir, tile | correct |
+|---|---:|---|---|---:|
+| 8, 4, 48 (default) | 186 | | 16, 4, 24 | 186 |
+| 8, 2, 48 | 188 | | 12, 4, 32 | 186 |
+| 8, 8, 48 | 186 | | 8, 4, 32 / 64 | 184 / 186 |
+| 6, 4, 64 | 180 (6 wrong axis) | | **6, 4, 32** | **106** (78 wrong axis) |
+
+The tile has to be sized against the line pitch at the axis resolution (12 pt lines: 8 px at 1/6, ~4.5 px at 1/8);
+1/6 with a tile that holds four lines breaks. The default sits on a plateau (everything from 1/8 to 1/16 works), which
+is the only reason to trust it beyond these 47 pages.
+
+### Not done / open
+- **Real 90/180 scans, other scripts and fonts.** All five documents are Danish/Latin text, four of them one scanner and
+  one book. The direction rule is a statement about Latin letter shapes (ascenders more frequent than descenders) and
+  will not carry over to Cyrillic, Greek or CJK; the axis rule may. No non-Latin sample exists locally.
+- **Pages with little text** (figures, blank facing pages, title pages): the confidence gate is the only protection and
+  is untested. A whole-document vote (idea 3 in the issue: run on a few pages, apply the majority) was not needed for
+  accuracy on this suite, and would be the next step if single pages turn out unreliable. It is a plan change, not a detector
+  change, and would make a genuinely mixed document wrong.
+- **Mixed orientation on one page** (`ren pdf` p2) is unsolved by design: one quarter turn per page.
+- `ocrs` and other OCR crates (idea 4) were **not evaluated**: the hand-made detector was accurate and ~11× faster than
+  Tesseract already, and an OCR model would bring a model file and a heavier dependency, against the purpose of #30.
+- Tesseract stays available (`BITONAL_OSD=tesseract`); nothing here retires it for documents outside this suite.
+
+### Verdict for #30
+Own detector as the default for `--rotate`: no system dependency, 186/188 on the local suite (misses: one ambiguous
+page), identical output to Tesseract on all six scans, 11× faster per page. The weak part is coverage of the test, not
+the numbers: five Latin documents and synthetic 90/180.

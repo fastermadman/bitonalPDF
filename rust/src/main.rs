@@ -7,6 +7,7 @@
 //   BITONAL_SLOTFLAT=1      flatten each slot after crop/deskew like bash, instead of once on the full page
 //   BITONAL_DESKEW_FIRST=1  estimate the skew on the whole page and straighten it before measuring crop/gutter
 //   BITONAL_INKGUTTER=1     gutter profile from the 60 % ink map instead of the lenient grey level (threshold once)
+//   BITONAL_OSD=tesseract   orientation by Tesseract OSD (as bash) instead of the own detector (#30); --osd-eval prints its accuracy
 use hayro::hayro_interpret::font::Glyph;
 use hayro::hayro_interpret::hayro_syntax::Pdf;
 use hayro::hayro_interpret::hayro_syntax::page::Page;
@@ -23,6 +24,12 @@ use std::time::Instant;
 
 // Tunables, same names and values as bitonalpdf.sh (see there and docs/lessons.md for why).
 const OSD_MIN_CONFIDENCE: f32 = 1.0;
+// Own orientation detector (#30): downsample factors for the axis and direction stages, tile size at the axis
+// stage's resolution, minimum confidence (below it the page is left as it is).
+const OSD_KA: usize = 8;
+const OSD_KD: usize = 4;
+const OSD_TILE: usize = 48;
+const OSD_OWN_MIN_CONFIDENCE: f32 = 0.25;
 const DOUBLE_AR_MIN: f64 = 1.15;
 const GUTTER_INK_THRESH: f32 = 230.0;
 const GUTTER_SEARCH_LO: f64 = 0.20;
@@ -80,6 +87,7 @@ struct Cfg {
     deskew_first: bool,
     ink_gutter: bool,
     timing: bool,
+    tess: bool, // BITONAL_OSD=tesseract: the old detector
 }
 
 /// Pass A result for one page, in output-dpi pixels (after the quarter-turn `rot`, and after straightening by
@@ -117,12 +125,15 @@ fn main() {
         deskew_first: env("BITONAL_DESKEW_FIRST"),
         ink_gutter: env("BITONAL_INKGUTTER"),
         timing: env("BITONAL_TIMING"),
+        tess: std::env::var("BITONAL_OSD").as_deref() == Ok("tesseract"),
     };
     let mut pos = vec![];
+    let mut eval = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--rotate" => cfg.rotate = true,
+            "--osd-eval" => eval = true,
             "--crop" => cfg.crop = true,
             "--deskew" => cfg.deskew = true,
             "--split" => {
@@ -147,13 +158,16 @@ fn main() {
     if &output == input {
         die("output must differ from input");
     }
-    if cfg.rotate && std::process::Command::new("tesseract").arg("--version").output().is_err() {
-        eprintln!("--rotate needs tesseract — proceeding without rotation");
+    if cfg.rotate && cfg.tess && std::process::Command::new("tesseract").arg("--version").output().is_err() {
+        eprintln!("BITONAL_OSD=tesseract needs tesseract — proceeding without rotation");
         cfg.rotate = false;
     }
 
     let data = Arc::new(std::fs::read(input).unwrap_or_else(|e| die(&format!("{input}: {e}"))));
     let n = Pdf::new(data.clone()).unwrap_or_else(|e| die(&format!("{input}: {e:?}"))).pages().len();
+    if eval {
+        return osd_eval(&data, n);
+    }
     let t0 = Instant::now();
 
     // Pass A: geometry per page. Only needed for crop/split, or to find the page skew first.
@@ -237,7 +251,14 @@ fn measure(page: &Page, i: usize, cfg: &Cfg) -> Meta {
     let t0 = Instant::now();
     let (g, _) = page_gray(page, cfg.dpi, false);
     let mut g = Img { w: g.w as usize, h: g.h as usize, px: g.px.iter().map(|&v| v as f32 / 255.0).collect() };
-    let rot = if cfg.rotate { osd(&g) } else { 0 };
+    let rot = match (cfg.rotate, cfg.tess) {
+        (false, _) => 0,
+        (true, true) => osd(&g),
+        (true, false) => match osd_own(&g, OSD_KA, OSD_KD, OSD_TILE) {
+            (q, c) if c >= OSD_OWN_MIN_CONFIDENCE => q,
+            _ => 0,
+        },
+    };
     g = rot90(&g, rot);
     let t1 = Instant::now();
     let k = (cfg.dpi / cfg.adpi).round().max(1.0) as usize;
@@ -805,7 +826,7 @@ fn gutter(flat: &Img) -> Option<(usize, usize)> {
     if ok { Some((gx, gw)) } else { valley() }
 }
 
-/// Tesseract OSD quarter turn (0/90/180/270), like bash rotate_page. Optional system dependency (#30).
+/// Tesseract OSD quarter turn (0/90/180/270), like bash rotate_page. Only with BITONAL_OSD=tesseract; `osd_own` is the default (#30).
 fn osd(g: &Img) -> u32 {
     let path = std::env::temp_dir().join(format!("bitonal-osd-{}-{:p}.pgm", std::process::id(), g));
     let mut f = format!("P5 {} {} 255\n", g.w, g.h).into_bytes();
@@ -821,6 +842,93 @@ fn osd(g: &Img) -> u32 {
     let deg: u32 = field("Rotate:").and_then(|v| v.parse().ok()).unwrap_or(0);
     let conf: f32 = field("Orientation confidence:").and_then(|v| v.parse().ok()).unwrap_or(0.0);
     if deg != 0 && conf >= OSD_MIN_CONFIDENCE { deg } else { 0 }
+}
+
+/// Orientation without Tesseract (#30): (quarter turn like `osd`, confidence). Two stages on flattened darkness maps:
+/// the axis from the sharpness of row vs column profiles (coarse, `ka`), then the direction along that axis (`kd`).
+fn osd_own(g: &Img, ka: usize, kd: usize, tile: usize) -> (u32, f32) {
+    let dark = |k: usize| {
+        let f = flatten(&downsample(g, k), BLUR_SIGMA / k as f32);
+        Img { w: f.w, h: f.h, px: f.px.iter().map(|&v| 1.0 - v).collect() }
+    };
+    let a = dark(ka);
+    let (sr, sc) = (sharp(&profiles(&a, true, tile)), sharp(&profiles(&a, false, tile)));
+    let rows = sr >= sc;
+    let d = dark(kd);
+    let d = if rows { d } else { rot90(&d, 90) };
+    let asym = direction(&profiles(&d, true, tile * ka / kd));
+    let q = match (rows, asym < 0.0) { (true, false) => 0, (true, true) => 180, (false, false) => 90, (false, true) => 270 };
+    (q, (if rows { sr / sc } else { sc / sr }).min(1e3) as f32 * asym.abs() as f32)
+}
+
+/// Ink per row (rows = true) or per column of every `l` x `l` tile inside the page's central 90 % (scanner borders
+/// out). Tiles, not whole-page profiles: skew smears a page-wide profile, and rows and columns get equal sample counts
+/// so neither is favoured by noise.
+fn profiles(g: &Img, rows: bool, l: usize) -> Vec<Vec<f64>> {
+    let (x0, y0) = (g.w / 20, g.h / 20);
+    let mut out = vec![];
+    for ty in (y0..g.h - y0).step_by(l).filter(|t| t + l <= g.h - y0) {
+        for tx in (x0..g.w - x0).step_by(l).filter(|t| t + l <= g.w - x0) {
+            out.push((0..l).map(|i| (0..l).map(|j| {
+                let (x, y) = if rows { (tx + j, ty + i) } else { (tx + i, ty + j) };
+                g.px[y * g.w + x] as f64
+            }).sum::<f64>() / l as f64).collect());
+        }
+    }
+    out
+}
+
+/// Sum of squared steps of the profiles, relative to their energy: high for sharp text lines, low for smooth ones.
+fn sharp(ps: &[Vec<f64>]) -> f64 {
+    let d: f64 = ps.iter().flat_map(|p| p.windows(2)).map(|w| (w[1] - w[0]).powi(2)).sum();
+    d / ps.iter().flatten().map(|v| v * v).sum::<f64>().max(1e-12)
+}
+
+/// > 0 for upright Latin text (rows top to bottom): per text line (between local minima of the smoothed profile),
+/// the ink above the x-height band (ascenders, capitals) outweighs the ink below the baseline (descenders).
+/// Tried first and dropped: steps down in density outweigh steps up (docs/rust-port.md section 3).
+fn direction(ps: &[Vec<f64>]) -> f64 {
+    let (mut above, mut below) = (0.0, 0.0);
+    for p in ps {
+        let sm: Vec<f64> = (0..p.len()).map(|i| p[i.saturating_sub(1)..(i + 2).min(p.len())].iter().sum::<f64>() / 3.0).collect();
+        let mut a = 0;
+        while a + 1 < sm.len() {
+            let mut b = a + 1;
+            while b + 1 < sm.len() && !(sm[b] <= sm[b - 1] && sm[b] < sm[b + 1] && b - a >= 3) {
+                b += 1;
+            }
+            let m = sm[a..=b].iter().cloned().fold(0.0, f64::max);
+            if m > 0.02 {
+                let hi: Vec<usize> = (a..=b).filter(|&i| sm[i] >= 0.5 * m).collect();
+                above += p[a..hi[0]].iter().sum::<f64>();
+                below += p[hi[hi.len() - 1] + 1..=b].iter().sum::<f64>();
+            }
+            a = b;
+        }
+    }
+    (above - below) / (above + below).max(1e-12)
+}
+
+/// #30 measurement: every page, upright (by Tesseract) and turned 0/90/180/270, own detector vs the truth.
+fn osd_eval(data: &Arc<Vec<u8>>, n: usize) {
+    let ev = |k: &str, d: usize| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+    let (ka, kd, tile) = (ev("BITONAL_OSDKA", OSD_KA), ev("BITONAL_OSDKD", OSD_KD), ev("BITONAL_OSDTILE", OSD_TILE));
+    let tess = std::env::var_os("EVAL_TESS").is_some();
+    let rows = par_pages(data, n, |p, i| {
+        let (g, _) = page_gray(p, 300.0, false);
+        let g = Img { w: g.w as usize, h: g.h as usize, px: g.px.iter().map(|&v| v as f32 / 255.0).collect() };
+        let up = rot90(&g, osd(&g));
+        (0..4).map(|q| {
+            let r = q * 90;
+            let x = rot90(&up, r);
+            let t0 = Instant::now();
+            let (d, c) = osd_own(&x, ka, kd, tile);
+            let own_ms = t0.elapsed().as_millis();
+            let (t, tms) = if tess { let t0 = Instant::now(); (osd(&x) as i64, t0.elapsed().as_millis()) } else { (-1, 0) };
+            format!("page {} turn {r} expect {} own {d} conf {c:.2} own_ms {own_ms} tess {t} tess_ms {tms}", i + 1, (360 - r) % 360)
+        }).collect::<Vec<_>>()
+    });
+    rows.into_iter().flatten().for_each(|l| println!("{l}"));
 }
 
 /// Gaussian blur, edges clamped. A sigma-30 blur is smooth, so it is computed on a copy downsampled by k (area
@@ -972,6 +1080,37 @@ mod tests {
         assert!(b.abs() <= 0.05, "{b}");
         assert_eq!(rot90(&rot90(&g, 90), 270).px, g.px);
         assert_eq!(rot90(&rot90(&g, 90), 90).px, rot90(&g, 180).px);
+    }
+
+    // Lines of "letters" (x-height bar, 30 % with an ascender above, 8 % with a descender below), turned by each quarter:
+    // osd_own must undo the turn. Fails with the direction sign flipped.
+    #[test]
+    fn orientation_found_for_all_turns() {
+        let (w, h) = (1200usize, 1600usize);
+        let mut px = vec![1.0f32; w * h];
+        let mut r = 12345u32;
+        let mut rnd = || { r = r.wrapping_mul(1103515245).wrapping_add(12345); (r >> 16) % 100 };
+        for line in 0..28 {
+            let base = 120 + line * 50;
+            let mut x0 = 100;
+            while x0 < 1080 {
+                let bw = 6 + rnd() as usize % 9;
+                let (asc, desc) = (rnd() < 30, rnd() < 8);
+                let (top, bot) = (base - 20 - if asc { 14 } else { 0 }, base + if desc { 14 } else { 0 });
+                for y in top..bot {
+                    for x in x0..x0 + bw {
+                        px[y * w + x] = 0.0;
+                    }
+                }
+                x0 += bw + 3 + rnd() as usize % 7;
+            }
+        }
+        let g = Img { w, h, px };
+        for q in [0, 90, 180, 270] {
+            let (d, c) = osd_own(&rot90(&g, q), OSD_KA, OSD_KD, OSD_TILE);
+            assert_eq!(d, (360 - q) % 360, "turn {q}");
+            assert!(c >= OSD_OWN_MIN_CONFIDENCE, "confidence {c}");
+        }
     }
 
     // The fast blur equals the exact Gaussian within 0.1 % of the range, also at a dark edge band and the corners.
