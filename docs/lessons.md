@@ -144,6 +144,11 @@ without `\n` makes `read` fail under `set -e`; `magick … -format %@` warns on 
   first guess for #22 and did not fix it; the real cause is the compose swap above. The gray is kept
   because it is closer to real ink.)
 - CI has no fonts: `magick … -annotate` fails there. Draw rectangles instead.
+- Comparing two 1-bit PDFs via `pdftoppm -mono` reports 0.5–2.4 % differing pixels even when the embedded
+  bitmaps are identical. Compare `pdfimages` output instead (#28).
+- A 1-bit (CCITT) scan page that is a few px off the target size looks different after poppler's downsampling
+  (dither smeared to grey) than when mapped 1:1 (dither kept). Same text, +28 % G4 size on the two such pages
+  in `sidste side …` (docs/rust-port.md, #28).
 - `pdfinfo` `Page size: W x H pts`: awk fields are `$3` = width, `$5` = height (twice wrong in smoke tests).
 - A regression test must be shown to **fail without the fix**; two of ours passed vacuously first.
 - Don't run `real.sh` and `smoke.sh` at once, and don't `git stash` the script while a run uses it.

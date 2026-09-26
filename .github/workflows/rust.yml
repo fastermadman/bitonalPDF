@@ -1,0 +1,27 @@
+name: rust
+
+# Rust spike (#28): build + the I/O round-trip test on all three OSes. Separate from `check`
+# (not a required status) and only when rust/ changes, since macOS/Windows minutes cost more.
+on:
+  pull_request:
+    paths: ['rust/**', '.github/workflows/rust.yml']
+  workflow_dispatch:
+
+concurrency:
+  group: rust-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --release
