@@ -17,8 +17,6 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
       - run: sudo apt-get update && sudo apt-get install -y poppler-utils tesseract-ocr shellcheck
       # apt's ImageMagick is v6 (no `magick` command); Homebrew is preinstalled but not on PATH.
       - run: |
@@ -30,10 +28,6 @@ jobs:
       - run: shellcheck -e SC1090,SC2153 bitonalpdf.sh build.sh tests/smoke.sh tests/real.sh tests/synth.sh tests/measure.sh
       - run: tests/smoke.sh
       - run: tests/synth.sh
-      - name: TEMP pre-fix comparison (remove)
-        run: |
-          for c in 7fa02c2 0d2b7a7; do git show $c:bitonalpdf.sh > /tmp/pre.sh; chmod +x /tmp/pre.sh; echo "== $c"; BIN=/tmp/pre.sh tests/synth.sh || true; done
-          magick -version | head -1
 
   build:
     runs-on: macos-latest
