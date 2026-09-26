@@ -26,7 +26,7 @@ Reference scans (local only) and the results `tests/real.sh` expects:
 | Thin stray stripes no longer widen the crop | Works on `skewed` (#23/#24) |
 | Newer ImageMagick | Works since #22 (before: silently wrong) |
 | Wide dark bands / striped edge (`sidste side …`) | Works (#23): bands gone on the contact sheet, page numbers kept |
-| Thin strokes lose ink at the hard 60 % threshold | **Not started** (#20) |
+| Thin strokes lose ink at the hard 60 % threshold | Measured, **not changed** (#20): a higher global threshold also darkens scanner-edge fringes |
 | Speed | **Slow**: ~5 min for 23 pp on an M-series Mac (#8/#9, the reason for the Rust port) |
 
 ## Problems, causes, fixes
@@ -88,6 +88,16 @@ not persist between tool calls, export the tunables when testing `content_box` b
 Effect on `sidste side …`: canvas 485x591 -> 389x581 pt (bands no longer enlarge it), page numbers kept. Also
 changed sizes slightly on `skewed`, `ryg-side`, `flerspaltet`, `ren-side` (checked by eye, page numbers present).
 **Known risk:** a running head lying alone in the top 10 % behind a gap is dropped like a band.
+
+### 6c. A higher final threshold (#20)
+A/B on `skewed` p5 (300 dpi, flatten then threshold): black fraction / G4 size at 60 % 7.1 % / 89.4 kB, 70 % 7.9 % /
+89.4 kB, 75 % 8.3 % / 89.7 kB; `-level 20%,90%` or sigmoidal ≈ 60 %; `-lat` 40x40-8% 8.9 % / 91.5 kB (+2 %, more noise);
+render 600 dpi → 300 → t60 6.9 % (worse). On a clean page (`ren-side`) 60/70/75 look the same. On thin scans 75 helps most
+(broken serifs and `tol.e` closed). **But** as the *default* it fails the real facts: at 70 the `dark-band` synth case and
+`skewed` p1 get ink at the box edge; at 65 `sidste side …` p11/p12 get a dark line along the bottom edge (fringe of the
+scanner border that the flatten leaves at 60–65 % grey). Reverted, default stays 60. Users of thin scans can pass 70–75 as
+argument 3. **Idea for the port:** relax the threshold only inside the text box / away from the page edge (or hysteresis:
+strong ink at 60 %, weaker pixels kept only when connected to it), not a global level.
 
 ### 7. A yardstick that says more than "ok" (#27)
 `tests/measure.sh file.pdf` prints per output page: size in pt, the ink bounding box in per-mille of the
