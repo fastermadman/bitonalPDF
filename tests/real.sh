@@ -6,7 +6,7 @@
 # compared per page when present (size exact, box +-FACT_TOL per-mille, footer ink equal), so a wrong
 # crop/split fails even though the file "looks fine". Create/refresh them, after LOOKING at out/, with --record.
 # Usage: tests/real.sh [--record] [--rotate --crop --split auto --deskew]   (default flags: all four)
-# ONLY=<name> runs just that scan.
+# ONLY=<name> runs just that scan. SIZE_TOL=<pt> allows that much page-size difference (default 0: exact; for another implementation).
 # BIN=<script> runs another implementation (default: bitonalpdf.sh in the repo root).
 set -uo pipefail
 cd "$(dirname "$0")/real" || exit 1
@@ -30,8 +30,8 @@ for f in *.pdf; do
   [ ! -f "$name.pages" ] || [ "$pout" = "$(cat "$name.pages")" ] || status="FAIL expected $(cat "$name.pages") pages"
   if [ $RECORD = 1 ]; then ../measure.sh "$o" > "$name.facts"; status="$status; facts recorded"
   elif [ -f "$name.facts" ]; then
-    d=$(../measure.sh "$o" | awk -v tol="${FACT_TOL:-20}" 'NR==FNR {e[$1]=$0; n++; next} { m++
-      split(e[$1], a); if ($2 != a[2] || $3 != a[3]) print "page " $1 ": size " $2 "x" $3 " (expected " a[2] "x" a[3] ")"
+    d=$(../measure.sh "$o" | awk -v tol="${FACT_TOL:-20}" -v stol="${SIZE_TOL:-0}" 'NR==FNR {e[$1]=$0; n++; next} { m++
+      split(e[$1], a); if ($2-a[2] > stol || a[2]-$2 > stol || $3-a[3] > stol || a[3]-$3 > stol) print "page " $1 ": size " $2 "x" $3 " (expected " a[2] "x" a[3] ")"
       else { for (i = 4; i <= 7; i++) if (($i-a[i] > tol) || (a[i]-$i > tol)) { print "page " $1 ": ink box " $4 "," $5 "," $6 "," $7 " (expected " a[4] "," a[5] "," a[6] "," a[7] ")"; break }
              if ($8 != a[8]) print "page " $1 ": footer ink " $8 " (expected " a[8] ")" } }
       END { if (m != n) print "page count " m " (facts say " n ")" }' "$name.facts" - | head -5)
