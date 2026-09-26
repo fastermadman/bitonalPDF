@@ -27,6 +27,7 @@ Reference scans (local only) and the results `tests/real.sh` expects:
 | Newer ImageMagick | Works since #22 (before: silently wrong) |
 | Wide dark bands / striped edge (`sidste side …`) | Works (#23): bands gone on the contact sheet, page numbers kept |
 | Thin strokes lose ink at the hard 60 % threshold | Works (#20): hysteresis, 60 % + weak pixels up to 75 % next to a seed < 45 % |
+| Orientation without Tesseract (Rust spike) | Works on the local suite: 186/188 turned pages, output identical to Tesseract, 11x faster per page; only Latin text and synthetic 90/180 tested (#30) |
 | Speed | **Slow**: ~5 min for 23 pp on an M-series Mac (#8/#9, the reason for the Rust port) |
 
 ## Problems, causes, fixes
@@ -145,6 +146,16 @@ Details and numbers: `docs/rust-port.md` section 2. What generalises:
   the smoothed copy, `sidste` p4 lost its page numbers to the band rule.
 - Deskew first does not work for books: on `skewed` 11 of 23 spreads have halves skewed > 0.5° apart, mostly opposite.
 
+### 9. Orientation without Tesseract (#30)
+Details and numbers: `docs/rust-port.md` section 3. What generalises:
+- Axis (portrait/landscape text) from row vs column profile sharpness only works at **coarse resolution** (1/8 of 300 dpi):
+  at 100 dpi glyph stems make columns look as "sharp" as lines. Tile size must match the line pitch at that resolution.
+- Compare rows and columns on equal-sized tiles; strips or whole-page profiles are biased by noise (short strips) or smeared by skew (spreads).
+- Direction: "baselines are crisper than x-height tops" worked on scans and was inverted on rendered vector text, so it measured
+  the scanner, not the letters. Ascender vs descender ink per line worked on all five documents. A signal that works on one kind
+  of source only is a coincidence until a second kind confirms it.
+- A test set made by rotating pages with `rot90` and Tesseract-as-truth overstates accuracy (no real 90/180 scans, and Tesseract scores 100 % by construction).
+
 ## Things that did not work or were misleading
 
 - `real.sh` says "ok" while the output is wrong. It only checks that a file is written, all pages have
@@ -236,7 +247,7 @@ Very likely yes, with caveats; none of this has been spiked yet *(unverified)*:
 - Rendering pages that are not a single embedded image needs pdfium (`pdfium-render`) or `hayro`; pdfium
   means shipping `pdfium.dll` next to the exe.
 - `--rotate` uses Tesseract OSD; on Windows Tesseract is a separate install, so keep it optional (as on
-  macOS) or replace it with an own orientation heuristic.
+  macOS) or replace it with an own orientation heuristic (done in the spike, #30).
 - The droplet (`bitonalPDF.app`, AppleScript) is macOS only. Windows needs its own front end: drag-and-drop
   onto the `.exe`, a shortcut, or a small GUI.
 - CI: add a `windows-latest` job running `smoke` for the Rust binary; keep bash-specific tests out of it.
