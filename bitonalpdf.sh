@@ -45,6 +45,7 @@ CROP_MIN_RUN=0.005            # content must be a run at least this wide (fracti
 CROP_RUN_GAP=0.003            # ...where gaps up to this wide (between letters/lines) don't break a run
 CROP_NEAR_DENSITY=0.004       # sparse ink (page numbers, running heads) this close to the text block is kept: weaker than MIN_DENSITY, but only within CROP_NEAR_FRAC
 CROP_NEAR_FRAC=0.08           # how far (fraction of page size) beyond the text block sparse ink is searched for
+CROP_BAND_FRAC=0.10          # a wide run lying entirely this close to an edge, cut off from the next run by a gap, is a scanner band: dropped
 CROP_EDGE_FRAC=0.015          # ignore the outer band of each edge (fraction of page size)
 CROP_PAD_FRAC=0.012           # margin kept around the detected text block
 
@@ -156,13 +157,14 @@ content_box() {
   magick "$w" \( +clone -blur 0x30 \) -compose "$DIVIDE" -composite \
     -colorspace Gray -threshold 60% -negate "$ink" || return 1
   local prof
-  for axis in cols rows; do
+  for axis in rows cols; do
     # raw 8-bit gray bytes, one per column/row (the txt: format differs between ImageMagick versions)
-    if [ "$axis" = cols ]; then prof=$(magick "$ink" -colorspace Gray -scale "${W}x1!" -depth 8 gray:- | od -An -v -tu1)
+    # columns are profiled inside the row range only, so a band above/below the text does not put its columns into the box
+    if [ "$axis" = cols ]; then read -r y0 ht < "$w.rows"; prof=$(magick "$ink" -crop "${W}x${ht}+0+${y0}" +repage -colorspace Gray -scale "${W}x1!" -depth 8 gray:- | od -An -v -tu1)
     else prof=$(magick "$ink" -colorspace Gray -scale "1x${H}!" -depth 8 gray:- | od -An -v -tu1); fi
     printf '%s\n' "$prof" | awk -v N="$([ "$axis" = cols ] && echo "$W" || echo "$H")" \
-      -v lo="$CROP_MIN_DENSITY" -v hi="$CROP_MAX_DENSITY" -v edge="$CROP_EDGE_FRAC" -v pad="$CROP_PAD_FRAC" -v nlo="$CROP_NEAR_DENSITY" -v near="$CROP_NEAR_FRAC" -v minr="$CROP_MIN_RUN" -v rungap="$CROP_RUN_GAP" '
-      { for (k = 1; k <= NF; k++) { i = n++; d = $k / 255; dens[i] = d } }
+      -v lo="$CROP_MIN_DENSITY" -v hi="$CROP_MAX_DENSITY" -v edge="$CROP_EDGE_FRAC" -v pad="$CROP_PAD_FRAC" -v nlo="$CROP_NEAR_DENSITY" -v near="$CROP_NEAR_FRAC" -v minr="$CROP_MIN_RUN" -v rungap="$CROP_RUN_GAP" -v bandf="$CROP_BAND_FRAC" -v sc="$([ "$axis" = cols ] && awk -v a="$ht" -v b="$H" 'BEGIN{print a/b}' || echo 1)" '
+      { for (k = 1; k <= NF; k++) { i = n++; d = $k / 255 * sc; dens[i] = d } }
       END {
         # runs of content rows/columns (density in range, inside the edge band), merged across small gaps;
         # the block spans the runs that are wide enough. No run wide enough: fall back to all of them.
@@ -172,18 +174,25 @@ content_box() {
           if (g) { if (rs < 0) rs = i; re = i; continue }
           if (rs >= 0 && (i - re > gap || i == fin)) {
             if (first0 == "") first0 = rs; last0 = re
-            if (re - rs + 1 >= minrun) { if (first == "") first = rs; last = re }
+            if (re - rs + 1 >= minrun) { nw++; wrs[nw] = rs; wre[nw] = re }
             rs = -1 }
         }
+        # a wide run lying entirely in the outer CROP_BAND_FRAC of the page that is cut off from the rest by a gap is a scanner band, not text
+        e0 = int(edge * N); band = int(bandf * N)
+        lo_lim = e0; hi_lim = N - 1 - e0
+        if (nw >= 2 && wre[1] <= band) { lo_lim = wre[1] + 1; for (k = 1; k < nw; k++) { wrs[k] = wrs[k+1]; wre[k] = wre[k+1] } nw-- }
+        if (nw >= 2 && wrs[nw] >= N - 1 - band) { hi_lim = wrs[nw] - 1; nw-- }
+        if (nw >= 1) { first = wrs[1]; last = wre[nw] }
         if (first == "") { first = first0; last = last0 }
         if (first == "") { first = 0; last = N - 1 }
         else {  # extend to sparse ink near the block; the speck filter still decides where the block is
           f0 = first; l0 = last
-          for (i = f0 - 1; i >= f0 - near * N && i >= edge * N; i--) if (dens[i] >= nlo && dens[i] <= hi) first = i
-          for (i = l0 + 1; i <= l0 + near * N && i <= N - 1 - edge * N; i++) if (dens[i] >= nlo && dens[i] <= hi) last = i
+          for (i = f0 - 1; i >= f0 - near * N && i >= lo_lim; i--) if (dens[i] >= nlo && dens[i] <= hi) first = i
+          for (i = l0 + 1; i <= l0 + near * N && i <= hi_lim; i++) if (dens[i] >= nlo && dens[i] <= hi) last = i
         }
         first = int(first - pad * N); last = int(last + pad * N)
         if (first < 0) first = 0; if (last > N - 1) last = N - 1
+        if (lo_lim > e0 && first < lo_lim) first = lo_lim; if (hi_lim < N - 1 - e0 && last > hi_lim) last = hi_lim
         print first, last - first + 1 }' > "$w.$axis"
   done
   read -r x0 wd < "$w.cols"; read -r y0 ht < "$w.rows"; rm -f "$w.cols" "$w.rows" "$ink"
@@ -285,7 +294,7 @@ export -f render rotate_page ink_profile content_box measure_geometry passA
 export IN TMP MODE DPI ROTATE CROP SPLIT_MODE SPLIT_FIXED
 export OSD_MIN_CONFIDENCE DOUBLE_AR_MIN GUTTER_INK_THRESH GUTTER_SEARCH_LO GUTTER_SEARCH_HI
 export GUTTER_MIN_WIDTH_FRAC GUTTER_MAX_WIDTH_FRAC GUTTER_MIN_INK_FRAC GRID_ROWS
-export GUTTER_VALLEY_RATIO GUTTER_EDGE_SHAVE GUTTER_MIN_INK_ROWS GUTTER_TRUST_FRAC CROP_MIN_DENSITY CROP_NEAR_DENSITY CROP_NEAR_FRAC CROP_MIN_RUN CROP_RUN_GAP CROP_MAX_DENSITY CROP_EDGE_FRAC CROP_PAD_FRAC
+export CROP_BAND_FRAC GUTTER_VALLEY_RATIO GUTTER_EDGE_SHAVE GUTTER_MIN_INK_ROWS GUTTER_TRUST_FRAC CROP_MIN_DENSITY CROP_NEAR_DENSITY CROP_NEAR_FRAC CROP_MIN_RUN CROP_RUN_GAP CROP_MAX_DENSITY CROP_EDGE_FRAC CROP_PAD_FRAC
 
 echo "Pass 1/2: rendering + measuring $PAGES pages (4 at a time, MODE=$MODE)..."
 seq 1 "$PAGES" | xargs -P 4 -I{} bash -c 'passA {}'
