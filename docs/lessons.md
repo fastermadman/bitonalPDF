@@ -27,7 +27,8 @@ Reference scans (local only) and the results `tests/real.sh` expects:
 | Newer ImageMagick | Works since #22 (before: silently wrong) |
 | Wide dark bands / striped edge (`sidste side …`) | Works (#23): bands gone on the contact sheet, page numbers kept |
 | Thin strokes lose ink at the hard 60 % threshold | Works (#20): hysteresis, 60 % + weak pixels up to 75 % next to a seed < 45 % |
-| Orientation without Tesseract (Rust spike) | Works on the local suite: 186/188 turned pages, output identical to Tesseract, 11x faster per page; only Latin text and synthetic 90/180 tested (#30) |
+| Orientation without Tesseract (Rust spike) | Works on the local suite: 186/188 turned pages, output identical to Tesseract, 11x faster per page; only Latin text and synthetic 90/180 tested (#30); **turns 12 of 77 upright photographed/colour pages** (#43, fix in #45) |
+| Mixed output (colour only where needed) | Decided in #38: whole colour pages chosen by page list; automatic region detection not worth it on this material (docs/rust-port.md section 5) |
 | Speed | **Slow**: ~5 min for 23 pp on an M-series Mac (#8/#9, the reason for the Rust port) |
 
 ## Problems, causes, fixes
@@ -171,6 +172,22 @@ Details and numbers: `docs/rust-port.md` section 4 (seven new scans with photos,
 - **ImageMagick 7.1.2 `compare -metric SSIM` prints 598…2300, not an SSIM;** the parenthesised value is (1 − SSIM)/2 (checked against an own implementation). Check a metric on a known pair before tabulating it.
 - **`MODE=images` can be bigger than the input** (a scan that is already a moderate JPEG: 1.47×); bash then reports "Not smaller" and writes nothing, so a baseline needs a scratch copy without that test to get the number.
 - `magick montage -label` gives nothing without a default font in this environment; pass `-font <file>`. Headless Chrome cannot screenshot a PDF here.
+
+### 11. Deciding on mixed output (#38)
+Details and numbers: `docs/rust-port.md` section 5. What generalises:
+- **A good AUC is not a usable operating point.** Tile colour separates pictures from text at AUC 0.97, yet every cut that keeps
+  all pictures flags half the text tiles, and every cut with few false alarms loses a third of the pictures. When one error kind is
+  expensive, score the cut you would ship (recall-first, held-out file) and count the damage in the unit that matters (regions lost,
+  bytes added), not the AUC.
+- **Tile recall is the wrong target when labels are boxes.** A box around a diagram or cover contains white paper; forcing 99 % of its
+  tiles to be caught drags the cut down to paper level. Grouping flagged tiles into bounding boxes fills such holes; score region coverage.
+- **Price the perfect detector before building a detector.** Region layers with *perfect* regions were only 5 % smaller than whole
+  colour pages with *perfect* page choice on this material; that made the region detector (and MRC) not worth building, whatever its accuracy.
+- **Re-check the baseline a new mode is compared against.** The images baseline carried the bash median bug (#40) on two of seven
+  files (spread-wide canvas; the output was 8 % and 16 % too large). A known bug in the reference tool quietly flatters whatever is compared with it.
+- **The pipeline's own geometry can cut the thing a new mode is meant to keep:** the pass-A crop box drops 17–45 % of 8 of 46
+  picture/cover/diagram regions. Check the interaction before tuning the new feature.
+- Unicode file names from macOS are NFD; a TSV written by Rust or typed by hand may be NFC. Normalise before joining on names.
 
 ## Things that did not work or were misleading
 
