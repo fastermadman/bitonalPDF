@@ -409,8 +409,8 @@ in the ignored folder; summary:
 | f3 | Book chapter: coloured cover + 8 text pages | 9 | 596×842 (p1), 842×596 | p1 2 RGB JPEG, p2–9 grey JPEG + a thin second grey image (56–192 px wide strip) | p1 single, 8 spread |
 | f4 | Textbook chapter, blue/orange page tabs and headings | 5 | 728×1032, `/Rotate 90` | 3 RGB JPEG, 2 CCITT | 5 spread |
 | f5 | Magazine article: cover, diagrams, pie chart, photos, ad column, flatbed scan at 200 ppi, A4 portrait | 7 | 595×842 | 7 RGB JPEG | 7 single |
-| f6 | Excerpt, photographed A3 spreads on a dark table, one sepia picture | 4 | 1191×842 | 4 RGB JPEG, 300 ppi | 1 spread, **3 double-shaped with no confident gutter** (left unsplit by the rule, split by the document median) |
-| f7 | Textbook chapter, photographed spreads, jacket, orange headings, pale-green boxes, orange lamp glow at the bottom of every photo | 9 | 728×1032, `/Rotate 90` | 9 RGB JPEG | 1 single (jacket), 8 spread |
+| f6 | Excerpt, photographed A3 spreads on a dark table, one sepia picture | 4 | 1191×842 | 4 RGB JPEG, 150 ppi | 1 spread, **3 double-shaped with no confident gutter** (left unsplit by the rule, split by the document median) |
+| f7 | Textbook chapter, photographed spreads, jacket, orange headings, pale-green boxes, orange lamp glow at the bottom of every photo | 9 | 728×1032, `/Rotate 90` | 9 RGB JPEG | 1 single (p2), 8 spread (incl. the jacket, p1) |
 
 Totals: 51 RGB JPEG pages, 15 CCITT, 8 grey JPEG (each with a strip image), 2 JBIG2, 1 RGB + RGB. The owner's description ("one coloured
 single-page cover, the rest double pages") fits f3 (cover p1, then 8 spreads); f2 has a cover but its other 17 pages are **single** book pages
@@ -485,6 +485,8 @@ is the output count against the number of spreads found, see the notes.
 Sums over the 7 files: input 56.5 MB; text 6.1 MB (0.11), images 22.3 MB (0.39); wall 12.0 s (text) vs 176 s (images), CPU 80 s vs 594 s
 (text with Tesseract OSD: 23.4 s wall, 156 s CPU). Every `real.sh`-style check holds (one page size in every output). The f3 images value
 comes from a scratch copy of `bitonalpdf.sh` with only the "not smaller" test removed (the pipeline itself is untouched); the real script writes nothing there.
+**Correction (#38):** the `images` rows carry the bash median bug #40 on f1 and f7 (spread-wide canvas): with the one-line fix, f1 is 8.02 MB and f7 2.56 MB
+(7 % and 14 % smaller), the other five are unchanged, sum 21.25 MB; section 5.6 uses the corrected numbers.
 
 Things the table hides, each measured:
 1. **The own orientation detector (#30) is wrong on 12 of these 77 pages; Tesseract on none.** Truth = upright as read from the contact sheets
@@ -667,7 +669,204 @@ Still missing (for #38 / later):
 - Error cost (picture treated as text vs the reverse) is not measured here; the baseline gives the two extremes (text mode: pictures destroyed, ~0.11 of input; images mode: ~0.39 of input, 1.47 on f3).
 
 ### 4.7 Observations for #38 (not proposals)
-- Output/input is 0.085–0.38 for text and 0.28–1.47 for images; the images output is 3.3–4.7× the text output on every file (f1 3.3×, f2 3.8×, f3 3.9×, f4 3.4×, f5 3.8×, f6 3.7×, f7 4.7×).
+- Output/input is 0.085–0.38 for text and 0.28–1.47 for images; the images output is 3.3–4.7× the text output on every file (f1 3.3×, f2 3.8×, f3 3.9×, f4 3.5×, f5 3.8×, f6 3.7×, f7 4.7×).
 - Chroma signals are cheap and separate colour pictures from body text well on colour scans; they say nothing on 1-bit/grey pages (25 of 77 here), where the tool has no colour to keep anyway.
 - The hard pairs are diagram vs coloured text and picture vs diagram; the labels for those are the least certain.
 - Detection would also have to survive the pipeline's own weak spots seen in 4.3: wrong orientation (12 pages), wrong splits on the dark-table photographs (f6), and the flatten blanking full-bleed pictures.
+
+## 5. B4 decision: mixed output (#38)
+
+Decisions on #38's questions, from the section 4 data plus four bounded measurements made here (5.0). Tags: **[measured]**,
+**[estimate]** (derived from measured parts, or a judgement), **[unknown]**; **[labels?]** = the number moves with the 19 uncertain
+pages or the ±0.03 boxes of 4.2; **[scans]** = all 77 pages are scans of one owner's books (no rendered page with figures, no hold-out
+source, one labeller). Nothing in the pipeline changed; `rust/src/main.rs` is untouched.
+
+### 5.0 New measurements
+Reproduce (outputs stay in the ignored folder; `D="tests/real/new pdfs dont upload"`, `W="$D/work"`, `B=rust/target/release/bitonalpdf`):
+```
+for s in A:geom B:slots; do for i in 1 2 3 4 5 6 7; do         # pass-A box/gutter and slots per page, prefixed with fN
+  BITONAL_TIMING=1 $B --crop --split auto $W/f$i.pdf /tmp/x.pdf 2>&1 >/dev/null | grep "^${s%:*} page" | sed "s/^${s%:*} page/f$i/"
+done > $W/m3/${s#*:}.txt; done
+# $W/m3/bitonalpdf-fix40.sh = bitonalpdf.sh + #40's one-line fix - the "not smaller" test; MODE=images, all four flags -> $W/m3/base40/fN.images.pdf
+python3 tests/mixed-eval.py $W/det.tsv "$D" $W/m3/geom.txt $W/m3/slots.txt $W/base $W/m3/base40 --sizes   # ~70 s, same output twice
+python3 tests/codec-table.py $W/crops/*.png        # now with the rows of 5.2/5.3
+python3 tests/codec-table.py --mrc-viewers         # synthetic PDF, no scan content
+```
+- **Pass-A geometry without `--rotate`** (all 77 pages are upright, 4.3 item 1), so boxes and labels share one frame; its split plan gives the
+  same output page counts as the `text + Tess` and `images` baselines (50/18/17/10/7/8/18).
+- **Images baseline without #40** (`$W/m3/base40`: scratch copy of `bitonalpdf.sh` with #40's verified one-line fix and without the "not
+  smaller" test): 21.25 MB instead of 22.27 MB (4.3 correction). All sizes below are **image-stream bytes** (`pdfimages -list`, 0.1 kB):
+  text 5.93 MB (the files are 6.15 MB), images 20.55 MB; per output page 46.3 kB vs 160.5 kB.
+- `tests/mixed-eval.py`: the four non-text classes pooled into one class `keep` (5.1); cuts chosen **leave-one-file-out** (cut from six files,
+  applied to the seventh); flagged 320-px tiles grouped 8-connected into bounding boxes + ½ tile; per labelled region the share covered by
+  the boxes; sizes per output page from the two baselines, and region sizes as JPEG q65 4:2:0 at 150 dpi (MODE=images' setting) of every box.
+- `tests/codec-table.py`: rows at MODE=images' setting, the real text-mode 1-bit output, one-colour mask, MRC-lite; `--mrc-viewers` renders
+  the layer constructs a region mode would need.
+
+### 5.1 Detection
+**Decision:** one class, `keep` (= picture ∪ diagram ∪ coloured-text ∪ cover) vs text, decided **per output page**; no automatic region
+detection. Automatic detection is only a *suggestion* (5.2), never the default action.
+
+- **Class borders the signals cannot carry** [measured, labels?]: diagram vs coloured text (tile AUC 0.50–0.55 on every signal except
+  `cc_big_frac` 0.78, 100/166 tiles from 3–4 files, 4.5); picture vs diagram (best 0.84, `cc_med_area`, with the least certain labels of 4.2);
+  grey picture vs text (one example, f1 p17) [unknown]; inline coloured sentences vs a coloured box (a labelling convention on f7, not a
+  signal). So nothing downstream may depend on *which* non-text class a region is: one class, one treatment, one codec (5.5).
+- **Page level, page `hasler`, cut = lowest keep page of the other six files:** 34 of 36 keep pages caught (misses f1 p1 and p2, both uncertain
+  labels), **10 of 41 text-only pages flagged, all 10 on RGB pages = 10 of 16 RGB text-only pages** [measured, scans]. In-sample: 36/36 and
+  15/16. The page AUC of 0.98 in 4.5 is mostly the source encoding: all 25 1-bit/grey pages are text-only here.
+- **Tile level, `hasler`, tiles inside the pass-A crop box, leave-one-file-out** [measured, labels?, scans]:
+
+| R (tile recall target) | keep tiles caught | FP rate (rest tiles) | regions < 90 % covered (of 46) | < 50 % covered | text-only pages with an FP box (of 41) |
+|---:|---:|---:|---:|---:|---:|
+| 0.5 | 461/903 | 0.006 | 22 | 15 | 0 |
+| 0.7 | 620/903 | 0.028 | 17 | 9 | 8 |
+| 0.8 | 715/903 | 0.099 | 13 | 8 | 14 |
+| 0.9 | 808/903 | 0.179 | 11 | 3 | 16 |
+| 0.99 | 895/903 | 0.480 | 5 | **0** | **16** |
+
+  There is no usable operating point: losing no region costs an FP box on every RGB text page (all 16), and a low FP rate loses a third of
+  the regions. Why, per file (tile `hasler` inside the crop box): the lowest 5 % of keep tiles are 1–4 on f1/f3/f5/f7 (white paper inside a
+  diagram or cover box, the grey engraving), while the top 5 % of rest tiles reach 5–30 (f7 99th percentile 78; unverified why: inline orange
+  sentences and the lamp glow on f7, paper tint under photo light on f1/f6). Without the crop-box restriction the FP rate at R 0.99 is 0.51 instead of 0.48, so the
+  dark surround is not the main source. Adding `entropy` (for grey pictures) flags 23 text pages instead of 16 and saves 2 regions at R 0.95.
+- **The pass-A crop box cuts what a colour mode must keep** [measured, labels?]: 8 of 46 labelled regions lose 17–45 % of their area to it
+  (covers worst: f7 p1 45 %, f2 p1 32 %, f3 p1 27 %; f5 diagrams 28–31 %). Any mode that keeps pictures inherits this (#46).
+- Level: page (output slot) because the region-level gain is small even with perfect regions (5.4) and the region detector cannot reach it.
+
+### 5.2 Error cost, safe default, override
+| error | size effect | damage | tag |
+|---|---|---|---|
+| text page kept in colour (FP, page level) | +114 kB per output page (160.5 vs 46.3 kB, ×3.5); per file 3.0–4.1× | none: text stays readable at 150 dpi JPEG (MODE=images' look) | measured |
+| text area kept as a region (FP, region level) | 11.9 MB of FP boxes at the safe point, 5.5 MB at R 0.8 (vs 5.93 MB for the whole text file) | none | measured, labels? |
+| colour page output as text (FN) | −114 kB per output page | photos/covers as the real text-mode 1-bit output: SSIM 0.27–0.50, PSNR 3–7 dB (vs MODE=images' JPEG q65 150 dpi: SSIM 0.89–0.94); diagrams 0.79–0.85 ; full-bleed pictures come out nearly blank (4.3 item 2) | measured |
+| region missed (FN, region level) | − its JPEG bytes | at R 0.8: 8 of 46 regions < 50 % covered (f1 p1 diagram, p2 coloured text, p17 picture, f5 p3 diagrams, f7 p3/p6/p8), i.e. binarised | measured, labels? |
+
+The damage of a miss is irreversible in the output (the figure is gone; only the input keeps it), the cost of a false alarm is bytes. So:
+- **Default: unchanged.** `MODE=text` stays text; nothing is coloured unless asked. [estimate: a judgement, from the table]
+- **Override / the mechanism:** `--colour-pages LIST` keeps the listed pages as MODE=images pages inside a text-mode PDF. LIST names input pages,
+  with an optional half (`12` = both halves, `12a`/`12b` = left/right, as bash names its slots): colouring whole input pages instead of the
+  labelled halves costs 12.72 vs 10.87 MB (2.14× vs 1.83× text; f7 2.47 vs 1.87 MB) [measured, labels?].
+- **`--colour-pages auto`**: the recall-first page detector (tiles in the crop box, R 0.99 cut from this suite) chooses the list and **prints
+  it** (like the gutter warning), so the user can correct it. On this material it colours 91 of 128 output pages (42 needed) [measured, scans].
+
+### 5.3 Coloured text
+**Decision:** a page with coloured text is a colour page (JPEG, page level) when the user lists it; no special coloured-text treatment now.
+Mask + colour is the attractive option on paper but needs a signal that does not exist (it must tell a coloured-text page from a picture or
+diagram page, the pair that fails in 5.1). [measured sizes, estimate legibility]
+
+Measured on the two coloured-text crops (`tests/codec-table.py`, bytes / PSNR / SSIM against the crop) [measured, scans; legibility = estimate]:
+
+| crop | JPEG q65 150 dpi (MODE=images) | 1-bit text mode (G4) | mask + 1 colour | MRC-lite (mask + colour over 75-dpi JPEG q50) |
+|---|---:|---:|---:|---:|
+| coloured-text-a (pale-green box) | 54.6 kB / 23.7 / 0.875 | 14.7 kB / 17.1 / 0.888 | 14.7 kB / 19.3 / 0.918 | 29.1 kB / 19.4 / 0.766 |
+| coloured-text-b (coloured heading) | 26.7 kB / 34.2 / 0.964 | 3.2 kB / 16.5 / 0.856 | 3.2 kB / 16.8 / 0.868 | 11.9 kB / 26.5 / 0.904 |
+
+Mask + one colour is 4–8× smaller than the JPEG and sharp (300-dpi G4), but drops the box fill (low PSNR on a); MRC-lite without
+inpainting is worse than either on the box. Size alone favours mask + colour; the missing piece is the signal (5.9 item 2), and a wrong
+call turns a picture into a one-colour silhouette (photo crops: SSIM 0.55–0.59 in that row).
+
+Open point with spec: 5.9 item 2.
+
+### 5.4 Structure
+**Decision:** whole output page, one image per page, as today: either the G4 page (text) or the JPEG page (colour). No region layers, no MRC,
+no JPX/JBIG2.
+- **Region layers with perfect regions are only 5 % smaller than whole pages with a perfect page list:** text + region JPEGs of the labelled
+  boxes 10.29 MB (1.73× text) vs 10.87 MB (1.83×) [measured parts, estimate sum: G4 under the boxes is not removed, overlapping boxes count
+  twice; labels?]. With detected regions it is worse than MODE=images: 20.87 MB at the safe point (3.52× vs 3.46×), 14.12 MB at R 0.8 with 8
+  regions lost [measured, scans].
+- **Viewers:** DCT and CCITT pages render in poppler, Ghostscript, PDFKit and hayro (4.4; the text-mode output is CCITT); a page-level mixed
+  PDF uses only those two filters, one image per page, on one page size (the text canvas; the JPEG page is 150 dpi on the same size in pt).
+  - **The layer constructs a region mode would need also render** [measured, synthetic]: `tests/codec-table.py --mrc-viewers` (a JPEG region with a 1-bit `/ImageMask` on top, and a low-res JPEG with a full-res stencil `/Mask`) gave the expected colours at all 21 check points in poppler, Ghostscript and PDFKit. So the rejection in 5.4 is about size, not viewers.
+- **pdf-writer without a new crate** writes the page (`image_xobject` + `Filter::DctDecode`, the same page/content code as the G4 page, and
+  `image_mask(true)` if a region mode ever comes). It does **not** encode JPEG: the dependency tree has only decoders (`zune-jpeg`,
+  `hayro-jpeg2000`) and a Flate encoder (`flate2`/`miniz_oxide`, via `png`). One new crate is needed for the JPEG page (5.5).
+
+### 5.5 Codec
+**Decision:** JPEG (DCTDecode) 4:2:0, **q65 at 150 dpi** = MODE=images' setting, for every colour page, whatever its content. [measured, scans]
+- One codec, because detection cannot tell the content types apart (5.1), and the best per-type choice would differ only for diagram vs
+  coloured text, the pair it fails on.
+- JPEG costs 0.10–0.13 of lossless PNG at 38–44 dB (q75, 300 dpi, 4.4). PNG-8/`/Indexed` is 2–3× larger for about the same PSNR on diagrams
+  (diagram-a 360 vs 113 kB) and much worse on photos (35.9 dB); JPEG 2000 at ratio 30 is about JPEG q75's size with +1–4 dB on photos/diagrams
+  but −1.8 dB on coloured-text-a, 5–10× the encode time, and there is no pure-Rust encoder (OpenJPEG is C; `hayro-jpeg2000` decodes);
+  WebP/AVIF have no PDF filter. The reference of 4.4 is itself a scanner JPEG, so all these are second-generation numbers.
+- At MODE=images' own setting: JPEG q65 at 150 dpi is 25–55 kB per crop (~200 kB on a whole cover) at SSIM 0.88–0.96; q75 at 150 dpi costs +20–25 % for +0.5 dB. That is the current MODE=images look, now as a number.
+- **New crate:** `jpeg-encoder` 0.7.1 (crates.io 2026-07, 7.9 M downloads), licence **(MIT OR Apache-2.0) AND IJG**: permissive, compatible with
+  the AGPL-3.0; the IJG part asks for the sentence "this software is based in part on the work of the Independent JPEG Group" in the
+  documentation of a binary distribution. Pure Rust, no system library. [measured: crates.io; not built here]
+
+### 5.6 Price
+**Size** (image-stream bytes, 7 files, 128 output pages; per file in `tests/mixed-eval.py` output) [measured, labels? for the label rows]:
+
+| variant | size | × text | colour output pages |
+|---|---:|---:|---:|
+| MODE=text (G4, `text + Tess` baseline) | 5.93 MB | 1.00 | 0 |
+| mixed, page list = labels, per half | **10.87 MB** | **1.83** | 42 |
+| mixed, page list = labels, whole input pages | 12.72 MB | 2.14 | 62 |
+| mixed, `auto` (safe, R 0.99) | 15.94 MB | 2.69 | 91 |
+| mixed, detector at R 0.8 (loses 8 regions) | 14.89 MB | 2.51 | 84 |
+| region layers, labelled boxes (not chosen, 5.4) | 10.29 MB | 1.73 | – |
+| MODE=images (bash, #40 fixed) | 20.55 MB | 3.46 | 128 |
+
+Per file with the label list: f1 4.57 MB (text 2.58, images 7.76), f2 1.32 (1.08 / 4.08), f3 0.71 (0.52 / 2.04), f4 0.54 (0.45 / 1.56),
+f5 1.26 = images (every page has colour), f6 0.60 (0.37 / 1.38), f7 1.87 (0.60 / 2.47). **So mixed with a page list saves about half of
+MODE=images (−47 %) and costs 1.8× text**, and all of that comes from pages the user wants in colour anyway.
+
+**Time** [estimate, with a measured upper bound]: text mode (Rust) is 12.0 s wall / 80 s CPU for the seven files (own orientation) or
+23.4 s / 156 s (Tesseract); MODE=images (bash, #40 fixed) 183 s wall / 611 s CPU. Mixed = the text path plus, per colour page, keeping the
+RGB of the page (Probe converts to luma today) and one JPEG encode of a 150-dpi page (1–4 MP; not measured in Rust, ImageMagick needs
+0.03–0.15 s for a 1–8 MP crop, 4.4). With a page list: + ≈ 0.1 s CPU per colour page, i.e. single-digit percent. With `auto`: plus the
+detection, whose upper bound is `--detect-eval` itself (300-dpi render + 11 signals + components): 44 s CPU for 77 pages (0.57 s per input
+page, measured in the audit run under load; 6–7 s wall idle), ≤ +28 % CPU on the Tesseract path; `hasler` alone is one pass over the RGB.
+
+### 5.7 Recommendation: go with reservations
+**Go** for **page-level mixed output with a page list**: text mode, plus MODE=images pages where the user lists them (`--colour-pages`), and
+`auto` as a printed suggestion. It halves MODE=images on this material (1.83× vs 3.46× text) with no new PDF construct and one new crate.
+**Not worth it** now: automatic region detection, region layers, MRC, per-type codecs, coloured text as mask + colour. The numbers that decide
+it: perfect regions beat perfect pages by only 5 % (5.4), and no tile cut is both safe and cheap (5.1).
+
+Prerequisites before implementing:
+1. **Orientation** (#45): 12 of 77 upright pages turned by the own detector, 8 of them colour pages; until fixed, mixed runs must use
+   `BITONAL_OSD=tesseract` or no `--rotate`.
+2. **Crop box vs pictures** and the dark-table splits (#46): the crop cuts 8 of 46 labelled regions by 17–45 %.
+3. **#40** merged, so the bash reference (MODE=images) is right.
+4. **A Rust JPEG page** (the images part of #9, or the first issue below) with the `jpeg-encoder` licence note.
+5. **A licence-clean test source with figures and a rendered page** (#47): every number here is from seven scans and one labeller;
+   `auto` must be re-measured there before anyone relies on it.
+
+Implementation issues (to create when the prerequisites are met; not created here):
+1. Rust: keep a page's RGB on demand (`page_gray`/`Probe`), JPEG page writer (`jpeg-encoder`, DCTDecode, 150 dpi on the text canvas),
+   i.e. `MODE=images` in Rust. Tests: round trip through hayro, one page size across both kinds.
+2. `--colour-pages LIST` with halves (`12`, `12a`, `12b`), mixed PDF, `real.sh`-style checks; target on f1–f7 with the label list:
+   ≤ 1.9× text and page sizes equal.
+3. `--colour-pages auto`: page detector of 5.1 (tiles in the crop box, R 0.99), printed list, a decision column in `--detect-eval`;
+   re-measured on the #47 sources.
+4. Conditional: coloured-text pages as G4 + one colour, only if 5.9 item 2 finds a signal.
+5. Conditional: region layers, only if new material shows a region-vs-page gap well above 5 %.
+
+What would change this: books where pictures are small parts of many text pages (region-vs-page gap ≫ 5 %); a detector with an FP rate
+< 0.05 at no lost region on a held-out source; a user for whom sharp 300-dpi text on colour pages matters more than bytes.
+
+### 5.8 What did not work
+- **Recall-first tile cuts** (R 0.95/0.99) as first planned: FP rate 0.23–0.48, because label boxes contain white paper; tile recall was the
+  wrong target, region coverage the right one.
+- **Page-relative `hasler`** (tile minus the page's median tile) to cancel paper tint and lamp glow: no gain (on covers and full-bleed
+  pages the median *is* the picture; the f7 glow is local).
+- **Restricting tiles to the crop box** lowered the FP rate only from 0.51 to 0.48 at R 0.99.
+- **`hasler` OR `entropy`** for grey pictures: 23 instead of 16 text pages with FP boxes, with one grey picture in the set.
+- The first size tables used the section 4.3 images baseline, which carries #40 on f1 and f7 (+8 %/+16 %); rerun with the fix.
+- Joining `--detect-eval` output with the file list failed on "å": macOS returns NFD names, the TSV had NFC; normalise before joining.
+- `--detect-eval` took 9.4 s wall in the audit rerun (other jobs running) instead of 6–7 s; output byte-identical.
+- The codec-table run takes ~9 min (large cover crops); the second run was not finished, so only the deterministic pipeline backs its reproducibility.
+
+### 5.9 Open points (each with a spec)
+1. **Page-level mixed in bash** (#38 allowed bash if cheap): `finish_slot` would choose text/JPEG per slot from the list, and the final
+   `magick "$TMP"/p*.[tj]* -density "$DPI" "$OUT"` already takes both kinds, but it sets **one** density, so a 150-dpi JPEG page would get
+   twice the page size. Spec: write the JPEG slots at the text canvas' size in pt (density per file, not on the command line), then check with
+   `pdfimages -list` that G4 stays CCITT and JPEG stays DCT (no recompression), and with `real.sh` that all pages have one size. Not measured.
+2. **Coloured text as G4 + one colour** needs (a) a page signal for "colour only in text/flat boxes" vs "picture/diagram": the 4.5 page
+   numbers (picture vs coloured-text `midtone` 0.98, `cc_big_frac` 0.95 on 7 vs 13 pages, uncertain labels) are too small to trust; measure
+   leave-one-file-out on the #47 sources; (b) the number of ink colours per page (hue clusters of ink pixels; f7 has orange, blue and pale
+   green); (c) the pale-box case (colour is the background, not the ink).
+3. **Chrome/Firefox (pdf.js)** were not tried (4.4); a page-level mixed PDF uses only DCT and CCITT, so this is low risk, but check once with
+   the first mixed output.
+4. **Grey pictures** (1 example): nothing detects them; they need the page list.
