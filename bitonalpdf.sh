@@ -335,7 +335,7 @@ if [ "$SPLIT_MODE" = auto ]; then
         awk -v x="$GUTTER_X" -v w="$W" 'BEGIN{printf "%.4f\n", x/w}' >> "$TMP/.gfrac"
       fi )
   done
-  [ -f "$TMP/.gfrac" ] && DOUBLE_GFRAC=$(median < "$TMP/.gfrac")
+  [ -f "$TMP/.gfrac" ] && DOUBLE_GFRAC=$(sort -n "$TMP/.gfrac" | awk '{a[NR]=$1} END{n=NR; print (n%2)?a[(n+1)/2]:(a[n/2]+a[n/2+1])/2}')
 fi
 
 REVIEW_FILE="$TMP/review.txt"
