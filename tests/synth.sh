@@ -24,6 +24,9 @@ for i in 1 2; do  # spread: block either side of a gutter + dark scanner border 
     -fill gray15 -draw "rectangle 0,0 1754,30" "$T/sp$i.png"
 done
 pdf "$T/sp?.png" "$T/spread.pdf"
+for i in 1 2; do magick -size 1754x1240 xc:white "$T/blk.png" -geometry +150+150 -composite "$T/blk.png" -geometry +780+150 -composite "$T/n$i.png"; done   # gap 4.6 % of the width: a trusted spine
+magick -size 1754x1240 xc:white "$T/blk.png" -geometry +150+150 -composite "$T/blk.png" -geometry +1064+150 -composite "$T/wd.png"       # gap 20 %: found, but too wide to trust
+magick "$T/n1.png" "$T/wd.png" "$T/n2.png" -compress none -units PixelsPerInch -density 150 "$T/spread3.pdf"
 page -fill gray15 -draw "rectangle 600,1150 606,1185" -draw "rectangle 620,1150 626,1185" -draw "rectangle 640,1150 646,1185" "$T/pn.png"; pdf "$T/pn.png" "$T/pn.pdf"      # #19 page number
 page -fill gray15 -draw "rectangle 40,300 43,900" "$T/bar.png"; pdf "$T/bar.png" "$T/bar.pdf"                                                                            # #23 thin stripe
 page -fill gray15 -draw "rectangle 0,0 500,130" "$T/band.png"; pdf "$T/band.png" "$T/band.pdf"                                                                            # #23 wide dark band (open)
@@ -52,6 +55,7 @@ run() {
 printf '%-12s %-11s %s\n' case result "measured (page[,page 2]: n W H x0 y0 x1 y1 foot; box in per-mille)"
 # W,H in pt: 150 dpi px * 72/150
 run spread     0 "$T/spread.pdf" 'n == 4 && sizes == 1 && H < 1240*72/150 - 20'   --crop --split auto  # 2 spreads -> 4 pages, top border cropped
+run even-gutter 0 "$T/spread3.pdf" 'n == 6 && sizes == 1 && W*150/72 < 1000'   --crop --split auto  # 2 trusted gutters (even count) + 1 untrusted: median gutter must not truncate to 0
 run pagenumber 0 "$T/pn.pdf"     'H*150/72 >= 1050'                               --crop               # #19: strokes at y1150..1185 survive
 run stripe     0 "$T/bar.pdf"    'W*150/72 < 640'                                 --crop               # #23: thin stripe far from the text does not widen the crop
 run wide-table 0 "$T/wide.pdf"   'n == 1'                                         --crop --split auto  # a table wider than tall, no gutter: never split

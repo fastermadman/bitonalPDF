@@ -458,6 +458,8 @@ Wall/CPU from `/usr/bin/time -l` (CPU = user + sys; bash: 4 pages at a time, inc
 "Sizes" = number of different output page sizes (1 = the `real.sh` check "all pages one size" holds); the page-count check
 is the output count against the number of spreads found, see the notes.
 
+The #40 median correction (see the reference section above) is now merged in `bitonalpdf.sh` (`DOUBLE_GFRAC`), and `skewed.facts` was re-recorded: bash and the numbers below no longer differ by that line.
+
 | file | mode | pages in → out | in | out | out / in | sizes | wall | CPU | peak RSS |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|
 | f1 | text | 25 → 48 | 31.39 MB | 2.65 MB | 0.085 | 1 | 4.0 s | 29.8 s | 2048 MB |
