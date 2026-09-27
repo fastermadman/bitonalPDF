@@ -872,3 +872,8 @@ What would change this: books where pictures are small parts of many text pages 
 3. **Chrome/Firefox (pdf.js)** were not tried (4.4); a page-level mixed PDF uses only DCT and CCITT, so this is low risk, but check once with
    the first mixed output.
 4. **Grey pictures** (1 example): nothing detects them; they need the page list.
+5. **Multi-run best-of for an uncertain gutter/deskew (only after #45/#46 are fixed):** run 2–3 parameter variants and pick the output by an
+   automatic score (gutter found without falling back, one page size across the document, ink fraction in the expected range). Only for
+   pages that already hit "no confident gutter" today; cheap in Rust because pass 1 (measuring) can be shared across variants. Risk: a bad
+   score function picks whichever variant games the score, not whichever is actually best — this is a safety net for genuinely ambiguous
+   pages, not a substitute for fixing the detectors.
