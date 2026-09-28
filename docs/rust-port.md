@@ -933,3 +933,44 @@ What would change this: books where pictures are small parts of many text pages 
    pages that already hit "no confident gutter" today; cheap in Rust because pass 1 (measuring) can be shared across variants. Risk: a bad
    score function picks whichever variant games the score, not whichever is actually best — this is a safety net for genuinely ambiguous
    pages, not a substitute for fixing the detectors.
+
+## 6. Splits on photographed spreads (#46)
+
+### Cause (measured on f6, per column)
+Not a dark band: **flattening turns the dark table white** (column darkness 0.00 over the table). What is left of the
+table is a white area, the book edge and a short gap between the edge and the page. On f6 p2 that gap (x 1132–1221 of
+4961, 23–25 %) lay inside the gutter's centre window (20–80 % of the *photo*) and was the widest ink-free run, so the
+page got a "trusted" gutter at the table edge. With only one trusted page, its position became the document median, and
+all four spreads were cut at 24 %. The result: a sliver of table (per-slot deskew 9.8° and 10.1°, the ±10° search edge)
+plus an uncut spread. On p1/p3/p4 the real spine (~57 %) had a little shadow (ink in 2 of 48 bands), so there was no
+ink-free run there. The valley fallback then chose the low-ink margin next to the table, whose outer side (the white table)
+has no ink, so it was rejected. The same happened on f1 p6/p11/p22/p23 (gutter at 859–962 px, 20–22 %).
+
+### Fix
+The centre window is 20–80 % of the **text box's columns** (pass A's `content_box`), not of the photo. Widths, valley
+sides and the left/right ink check stay fractions of the page. A first version cropped the profile to the box, which
+made the width limit (`GUTTER_MAX_WIDTH_FRAC`) box-relative. That turned the blank facing page of f3 p2 (723 px, just
+under 22 % of the page) into a valley cut through the left page's last line, so it was dropped. `cargo test`: `gutter_ignores_table_gap`
+(synthetic spread, asserts the whole-photo search takes the gap and the box search the spine).
+
+### Result (all four flags)
+| file | pages | spreads with a changed gutter | max per-slot deskew | output |
+|---|---|---|---|---|
+| f1 | 50 → 50 | p6, p11, p22, p23: 20–22 % → 53–58 % | 1.5° (same) | the 4 spreads were a sliver + an uncut spread, now two pages each (looked at) |
+| f2–f5, f7 | same | none | same | byte-identical |
+| f6 | 8 → 8 | all 4: 24 % (median of one bad page) → 55–60 % | **10.14° → 3.33°** | 8 single book pages, no slivers (looked at) |
+
+No page is left for review in any file (f6's 3 unsplit pages are gone; the median fallback isn't needed). Parity:
+`BIN=… SIZE_TOL=3 tests/real.sh` gives the same failures as main. `sidste` is identical. On `skewed`, output p1 (already
+a known mismatch, the #40 page, which is a near-blank half with the neighbour page's line ends in both) moves its cut
+51 px from a run to a valley. It looks the same at 60 dpi, but a speck now counts as footer ink. Pass-A gutters of
+the six older scans are otherwise unchanged.
+
+### Not fixed / not needed
+- The "darker than text is not text" cap (#45) was the first candidate, but it does not apply here: after flattening
+  the table is not dark. The spine-shadow signal and a gutter score (issue tasks 2) weren't needed, and neither was
+  a deskew cap: the 10° slots were the table slivers.
+- **Dark spine/edge bands remain** on some split pages (f1 output p13, also on main, and p43, which is a page that
+  main didn't produce correctly at all). They sit between the cut and the text. That is a crop question for the slot,
+  not a gutter one.
+- The single-page median box for portrait pages among spreads (#46 comment) wasn't hit by any file and wasn't measured.

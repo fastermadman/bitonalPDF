@@ -189,6 +189,14 @@ Details and numbers: `docs/rust-port.md` section 5. What generalises:
   picture/cover/diagram regions. Check the interaction before tuning the new feature.
 - Unicode file names from macOS are NFD; a TSV written by Rust or typed by hand may be NFC. Normalise before joining on names.
 
+### 12. Photographed spreads on a dark table (#46)
+Details: `docs/rust-port.md` section 6. Flattening turns a dark table white, so the gap between the book edge and the
+page becomes an ink-free run next to the page. Relative to the whole photo, that gap can lie inside the gutter's 20–80 %
+window and win. Fix: take the window from the text box's columns, but keep widths relative to the page (a box-relative
+width limit turned a blank facing page into a bad valley cut). One wrong trusted gutter also became the document median
+for every other spread, so a single bad page can split a whole document wrong. Per-column numbers on one failing page
+found the cause at once. The #45 idea ("darker than text is not text") did not apply, because the table is no longer dark after flattening.
+
 ## Things that did not work or were misleading
 
 - `real.sh` says "ok" while the output is wrong. It only checks that a file is written, all pages have
