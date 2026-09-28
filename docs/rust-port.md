@@ -464,7 +464,7 @@ in the ignored folder; summary:
 | f3 | Book chapter: coloured cover + 8 text pages | 9 | 596×842 (p1), 842×596 | p1 2 RGB JPEG, p2–9 grey JPEG + a thin second grey image (56–192 px wide strip) | p1 single, 8 spread |
 | f4 | Textbook chapter, blue/orange page tabs and headings | 5 | 728×1032, `/Rotate 90` | 3 RGB JPEG, 2 CCITT | 5 spread |
 | f5 | Magazine article: cover, diagrams, pie chart, photos, ad column, flatbed scan at 200 ppi, A4 portrait | 7 | 595×842 | 7 RGB JPEG | 7 single |
-| f6 | Excerpt, photographed A3 spreads on a dark table, one sepia picture | 4 | 1191×842 | 4 RGB JPEG, 150 ppi | 1 spread, **3 double-shaped with no confident gutter** (left unsplit by the rule, split by the document median) |
+| f6 | Excerpt, photographed A3 spreads on a dark table, one sepia picture | 4 | 1191×842 | 4 RGB JPEG, 150 ppi | 1 spread, **3 double-shaped with no confident gutter** (left unsplit by the rule, split by the document median; fixed in #46, section 6) |
 | f7 | Textbook chapter, photographed spreads, jacket, orange headings, pale-green boxes, orange lamp glow at the bottom of every photo | 9 | 728×1032, `/Rotate 90` | 9 RGB JPEG | 1 single (p2), 8 spread (incl. the jacket, p1) |
 
 Totals: 51 RGB JPEG pages, 15 CCITT, 8 grey JPEG (each with a strip image), 2 JBIG2, 1 RGB + RGB. The owner's description ("one coloured
@@ -555,7 +555,7 @@ Things the table hides, each measured:
    **Fixed in #45** (section 3, "Photographed pages"): dark edges and pictures were read as text lines; after the fix 0 of the 77 are turned.
 2. **Text mode destroys pictures, as expected:** f1's paintings and photos become black/white blotches, and some full-bleed picture pages come out nearly blank (seen on the contact
    sheet of f1 output pages 9–16; unverified why: the flatten divides a uniform area by its own blur), coloured elements become grey on white. This is the case the mixed mode is for.
-3. **f6 (dark table, photographed A3): both modes split wrongly.** 3 of 4 spreads have no confident gutter; the median fallback cuts them, giving 8 pages, several of them
+3. **f6 (dark table, photographed A3): both modes split wrongly** (fixed in #46, section 6). 3 of 4 spreads have no confident gutter; the median fallback cuts them, giving 8 pages, several of them
    almost empty halves; a spine band remains in text mode; the deskew estimate on some slots hits the ±10° limit (10.14°, 9.78°). `f7` and `f1` show dark spine/edge bands in text mode too.
    These are baseline flaws of the existing pipeline on this material, not of a mixed mode.
 4. **`MODE=images` can be larger than the input** (f3: 2.12 MB vs 1.44 MB, ratio 1.47; f6 0.78, f2 0.56): the input was already a moderately compressed JPEG.
@@ -730,7 +730,7 @@ Still missing (for #38 / later):
 - Output/input is 0.085–0.38 for text and 0.28–1.47 for images; the images output is 3.3–4.7× the text output on every file (f1 3.3×, f2 3.8×, f3 3.9×, f4 3.5×, f5 3.8×, f6 3.7×, f7 4.7×).
 - Chroma signals are cheap and separate colour pictures from body text well on colour scans; they say nothing on 1-bit/grey pages (25 of 77 here), where the tool has no colour to keep anyway.
 - The hard pairs are diagram vs coloured text and picture vs diagram; the labels for those are the least certain.
-- Detection would also have to survive the pipeline's own weak spots seen in 4.3: wrong orientation (12 pages; fixed in #45), wrong splits on the dark-table photographs (f6), and the flatten blanking full-bleed pictures.
+- Detection would also have to survive the pipeline's own weak spots seen in 4.3: wrong orientation (12 pages; fixed in #45), wrong splits on the dark-table photographs (f6; fixed in #46, section 6), and the flatten blanking full-bleed pictures.
 
 ## 5. B4 decision: mixed output (#38)
 
@@ -788,7 +788,7 @@ detection. Automatic detection is only a *suggestion* (5.2), never the default a
   sentences and the lamp glow on f7, paper tint under photo light on f1/f6). Without the crop-box restriction the FP rate at R 0.99 is 0.51 instead of 0.48, so the
   dark surround is not the main source. Adding `entropy` (for grey pictures) flags 23 text pages instead of 16 and saves 2 regions at R 0.95.
 - **The pass-A crop box cuts what a colour mode must keep** [measured, labels?]: 8 of 46 labelled regions lose 17–45 % of their area to it
-  (covers worst: f7 p1 45 %, f2 p1 32 %, f3 p1 27 %; f5 diagrams 28–31 %). Any mode that keeps pictures inherits this (#46).
+  (covers worst: f7 p1 45 %, f2 p1 32 %, f3 p1 27 %; f5 diagrams 28–31 %). Any mode that keeps pictures inherits this (#46 fixed only the splits; the crop box is unchanged).
 - Level: page (output slot) because the region-level gain is small even with perfect regions (5.4) and the region detector cannot reach it.
 
 ### 5.2 Error cost, safe default, override
@@ -885,7 +885,7 @@ it: perfect regions beat perfect pages by only 5 % (5.4), and no tile cut is bot
 Prerequisites before implementing:
 1. ~~**Orientation** (#45)~~: done, 0 of 77 upright pages turned (section 3, "Photographed pages"). Photographed pages that really are
    turned are mostly left as they are by the own detector; use `BITONAL_OSD=tesseract` for those.
-2. **Crop box vs pictures** and the dark-table splits (#46): the crop cuts 8 of 46 labelled regions by 17–45 %.
+2. **Crop box vs pictures** and the dark-table splits (splits fixed in #46; the crop box is still open): the crop cuts 8 of 46 labelled regions by 17–45 %.
 3. **#40** merged, so the bash reference (MODE=images) is right.
 4. **A Rust JPEG page** (the images part of #9, or the first issue below) with the `jpeg-encoder` licence note.
 5. **A licence-clean test source with figures and a rendered page** (#47): every number here is from seven scans and one labeller;
@@ -928,8 +928,49 @@ What would change this: books where pictures are small parts of many text pages 
 3. **Chrome/Firefox (pdf.js)** were not tried (4.4); a page-level mixed PDF uses only DCT and CCITT, so this is low risk, but check once with
    the first mixed output.
 4. **Grey pictures** (1 example): nothing detects them; they need the page list.
-5. **Multi-run best-of for an uncertain gutter/deskew (only after #45/#46 are fixed):** run 2–3 parameter variants and pick the output by an
+5. **Multi-run best-of for an uncertain gutter/deskew (#45 and #46 are fixed now):** run 2–3 parameter variants and pick the output by an
    automatic score (gutter found without falling back, one page size across the document, ink fraction in the expected range). Only for
    pages that already hit "no confident gutter" today; cheap in Rust because pass 1 (measuring) can be shared across variants. Risk: a bad
    score function picks whichever variant games the score, not whichever is actually best — this is a safety net for genuinely ambiguous
    pages, not a substitute for fixing the detectors.
+
+## 6. Splits on photographed spreads (#46)
+
+### Cause (measured on f6, per column)
+Not a dark band: **flattening turns the dark table white** (column darkness 0.00 over the table). What is left of the
+table is a white area, the book edge and a short gap between the edge and the page. On f6 p2 that gap (x 1132–1221 of
+4961, 23–25 %) lay inside the gutter's centre window (20–80 % of the *photo*) and was the widest ink-free run, so the
+page got a "trusted" gutter at the table edge. With only one trusted page, its position became the document median, and
+all four spreads were cut at 24 %. The result: a sliver of table (per-slot deskew 9.8° and 10.1°, the ±10° search edge)
+plus an uncut spread. On p1/p3/p4 the real spine (~57 %) had a little shadow (ink in 2 of 48 bands), so there was no
+ink-free run there. The valley fallback then chose the low-ink margin next to the table, whose outer side (the white table)
+has no ink, so it was rejected. The same happened on f1 p6/p11/p22/p23 (gutter at 859–962 px, 20–22 %).
+
+### Fix
+The centre window is 20–80 % of the **text box's columns** (pass A's `content_box`), not of the photo. Widths, valley
+sides and the left/right ink check stay fractions of the page. A first version cropped the profile to the box, which
+made the width limit (`GUTTER_MAX_WIDTH_FRAC`) box-relative. That turned the blank facing page of f3 p2 (723 px, just
+under 22 % of the page) into a valley cut through the left page's last line, so it was dropped. `cargo test`: `gutter_ignores_table_gap`
+(synthetic spread, asserts the whole-photo search takes the gap and the box search the spine).
+
+### Result (all four flags)
+| file | pages | spreads with a changed gutter | max per-slot deskew | output |
+|---|---|---|---|---|
+| f1 | 50 → 50 | p6, p11, p22, p23: 20–22 % → 53–58 % | 1.5° (same) | the 4 spreads were a sliver + an uncut spread, now two pages each (looked at) |
+| f2–f5, f7 | same | none | same | byte-identical |
+| f6 | 8 → 8 | all 4: 24 % (median of one bad page) → 55–60 % | **10.14° → 3.33°** | 8 single book pages, no slivers (looked at) |
+
+No page is left for review in any file (f6's 3 unsplit pages are gone; the median fallback isn't needed). Parity:
+`BIN=… SIZE_TOL=3 tests/real.sh` gives the same failures as main. `sidste` is identical. On `skewed`, output p1 (already
+a known mismatch, the #40 page, which is a near-blank half with the neighbour page's line ends in both) moves its cut
+51 px from a run to a valley. It looks the same at 60 dpi, but a speck now counts as footer ink. Pass-A gutters of
+the six older scans are otherwise unchanged.
+
+### Not fixed / not needed
+- The "darker than text is not text" cap (#45) was the first candidate, but it does not apply here: after flattening
+  the table is not dark. The spine-shadow signal and a gutter score (issue tasks 2) weren't needed, and neither was
+  a deskew cap: the 10° slots were the table slivers.
+- **Dark spine/edge bands remain** on some split pages (f1 output p13, also on main, and p43, which is a page that
+  main didn't produce correctly at all). They sit between the cut and the text. That is a crop question for the slot,
+  not a gutter one.
+- The single-page median box for portrait pages among spreads (#46 comment) wasn't hit by any file and wasn't measured.

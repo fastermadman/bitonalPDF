@@ -282,9 +282,11 @@ fn measure(page: &Page, i: usize, cfg: &Cfg) -> Meta {
     let (w, h) = (g.w as i64, g.h as i64);
     let kk = k as i64;
     let mut m = Meta { rot, angle, w, cand: w as f64 / h as f64 >= DOUBLE_AR_MIN, ..Default::default() };
+    let mut bx = (0, flat.w);
     if cfg.crop || cfg.split != Split::Off {
         let [x0, y0, x1, y1] = content_box(&ink, flat.w, flat.h);
         m.trim = Some([x0 as i64 * kk, y0 as i64 * kk, (x1 as i64 * kk).min(w), (y1 as i64 * kk).min(h)]);
+        bx = (x0, x1);
     }
     if m.cand {
         m.gutter = match cfg.split {
@@ -295,7 +297,7 @@ fn measure(page: &Page, i: usize, cfg: &Cfg) -> Meta {
                 } else {
                     flat
                 };
-                gutter(&prof).map(|(x, gw)| (x as i64 * kk, gw as i64 * kk))
+                gutter(&prof, bx).map(|(x, gw)| (x as i64 * kk, gw as i64 * kk))
             }
             Split::Off => None,
         };
@@ -765,8 +767,11 @@ fn axis_box(dens: &[f64]) -> (usize, usize) {
 
 /// Gutter of a double page from a flattened image: Some((x, width)) or None. Port of bash ink_profile + its awk:
 /// column profile over GRID_ROWS bands (top/bottom shaved), widest ink-free run in the centre window, else the
-/// deepest valley of the smoothed ink count.
-fn gutter(flat: &Img) -> Option<(usize, usize)> {
+/// deepest valley of the smoothed ink count. The centre window is 20-80 % of the text box's columns x0..x1, not of
+/// the whole photo: flattening turns a dark table white, and the gap between its edge and the page was the widest
+/// ink-free run in the photo's centre window (f6, #46). Widths stay fractions of the page (a box-relative width limit
+/// turned a blank facing page on f3 p2 into a valley cut).
+fn gutter(flat: &Img, (x0, x1): (usize, usize)) -> Option<(usize, usize)> {
     let (w, h) = (flat.w, flat.h);
     let shave = (h as f64 * GUTTER_EDGE_SHAVE) as usize;
     let hh = h - 2 * shave;
@@ -784,7 +789,8 @@ fn gutter(flat: &Img) -> Option<(usize, usize)> {
     }
     let ink: Vec<bool> = cnt.iter().map(|&c| c >= GUTTER_MIN_INK_ROWS).collect();
     let wf = w as f64;
-    let (lo, hi) = (GUTTER_SEARCH_LO, GUTTER_SEARCH_HI);
+    let bw = (x1 - x0) as f64;
+    let (lo, hi) = ((x0 as f64 + bw * GUTTER_SEARCH_LO) / wf, (x0 as f64 + bw * GUTTER_SEARCH_HI) / wf);
 
     let valley = || {
         let sw = ((wf * 0.003) as i64).max(1);
@@ -1295,6 +1301,25 @@ mod tests {
             p[i] = if i < 66 { 0.12 * (i - 59) as f64 } else { 0.7 - 0.02 * (i - 66) as f64 };
         }
         assert!(direction(&[p]) > 0.0);
+    }
+
+    // A photographed spread (#46): table flattened white, book edge, a margin gap at 22 % of the photo, text, a
+    // spine with a little shadow (ink in a few bands, so no ink-free run), text. The whole-photo search took the gap.
+    #[test]
+    fn gutter_ignores_table_gap() {
+        let (w, h) = (1000usize, 600usize);
+        let px: Vec<f32> = (0..w * h)
+            .map(|i| {
+                let (x, y) = (i % w, i / w);
+                let text = (240..560).contains(&x) || (600..950).contains(&x);
+                let dark = (190..200).contains(&x) || (text && (y / 6) % 2 == 0) || ((560..600).contains(&x) && (100..130).contains(&y));
+                if dark { 0.0 } else { 1.0 }
+            })
+            .collect();
+        let flat = Img { w, h, px };
+        assert!(gutter(&flat, (0, w)).is_some_and(|(x, _)| x < 250), "the setup must reproduce the old failure");
+        let g = gutter(&flat, (190, 950));
+        assert!(g.is_some_and(|(x, _)| (560..600).contains(&x)), "{g:?}");
     }
 
     // The fast blur equals the exact Gaussian within 0.1 % of the range, also at a dark edge band and the corners.
