@@ -8,6 +8,7 @@
 //   BITONAL_DESKEW_FIRST=1  estimate the skew on the whole page and straighten it before measuring crop/gutter
 //   BITONAL_INKGUTTER=1     gutter profile from the 60 % ink map instead of the lenient grey level (threshold once)
 //   BITONAL_OSD=tesseract   orientation by Tesseract OSD (as bash) instead of the own detector (#30); --osd-eval prints its accuracy
+//                           (EVAL_UPRIGHT=1: the input pages are upright, no Tesseract truth; #45)
 // --detect-eval a.pdf [b.pdf ...] prints candidate picture/colour signals per page and tile as TSV (#43, docs/rust-port.md section 4).
 use hayro::hayro_interpret::font::Glyph;
 use hayro::hayro_interpret::hayro_syntax::Pdf;
@@ -31,6 +32,8 @@ const OSD_KA: usize = 8;
 const OSD_KD: usize = 4;
 const OSD_TILE: usize = 48;
 const OSD_OWN_MIN_CONFIDENCE: f32 = 0.25;
+// Darkness (0..1, flattened) above which a profile value is not text: text lines peak at ~0.2-0.3 (#45).
+const OSD_DARK_MAX: f64 = 0.4;
 const DOUBLE_AR_MIN: f64 = 1.15;
 const GUTTER_INK_THRESH: f32 = 230.0;
 const GUTTER_SEARCH_LO: f64 = 0.20;
@@ -853,18 +856,32 @@ fn osd(g: &Img) -> u32 {
 /// Orientation without Tesseract (#30): (quarter turn like `osd`, confidence). Two stages on flattened darkness maps:
 /// the axis from the sharpness of row vs column profiles (coarse, `ka`), then the direction along that axis (`kd`).
 fn osd_own(g: &Img, ka: usize, kd: usize, tile: usize) -> (u32, f32) {
+    let (q, ratio, asym) = osd_parts(g, ka, kd, tile);
+    (q, ratio * asym.abs())
+}
+
+/// `osd_own` before the confidence is formed: (quarter turn, axis ratio, direction score). `--osd-eval` prints both.
+fn osd_parts(g: &Img, ka: usize, kd: usize, tile: usize) -> (u32, f32, f32) {
     let dark = |k: usize| {
         let f = flatten(&downsample(g, k), BLUR_SIGMA / k as f32);
         Img { w: f.w, h: f.h, px: f.px.iter().map(|&v| 1.0 - v).collect() }
     };
     let a = dark(ka);
-    let (sr, sc) = (sharp(&profiles(&a, true, tile)), sharp(&profiles(&a, false, tile)));
+    // Tiles with a row or column darker than text lines get (pictures, dark table or book edge in a photo, #45) are
+    // left out: their edges would outweigh the text.
+    let dense = |p: &[f64]| p.iter().any(|&v| v > OSD_DARK_MAX);
+    let (pr, pc): (Vec<_>, Vec<_>) =
+        profiles(&a, true, tile).into_iter().zip(profiles(&a, false, tile)).filter(|(r, c)| !dense(r) && !dense(c)).unzip();
+    if pr.is_empty() {
+        return (0, 0.0, 0.0); // nothing text-like (full-bleed picture): no evidence, and 0/0 would make the ratio NaN -> 1e3
+    }
+    let (sr, sc) = (sharp(&pr), sharp(&pc));
     let rows = sr >= sc;
     let d = dark(kd);
     let d = if rows { d } else { rot90(&d, 90) };
     let asym = direction(&profiles(&d, true, tile * ka / kd));
     let q = match (rows, asym < 0.0) { (true, false) => 0, (true, true) => 180, (false, false) => 90, (false, true) => 270 };
-    (q, (if rows { sr / sc } else { sc / sr }).min(1e3) as f32 * asym.abs() as f32)
+    (q, (if rows { sr / sc } else { sc / sr }).min(1e3) as f32, asym as f32)
 }
 
 /// Ink per row (rows = true) or per column of every `l` x `l` tile inside the page's central 90 % (scanner borders
@@ -892,6 +909,8 @@ fn sharp(ps: &[Vec<f64>]) -> f64 {
 
 /// > 0 for upright Latin text (rows top to bottom): per text line (between local minima of the smoothed profile),
 /// the ink above the x-height band (ascenders, capitals) outweighs the ink below the baseline (descenders).
+/// "Lines" peaking above OSD_DARK_MAX are dark edges, not text: a book edge at the bottom of a photo reads as one
+/// huge descender and turned whole documents by 180° (#45).
 /// Tried first and dropped: steps down in density outweigh steps up (docs/rust-port.md section 3).
 fn direction(ps: &[Vec<f64>]) -> f64 {
     let (mut above, mut below) = (0.0, 0.0);
@@ -904,7 +923,7 @@ fn direction(ps: &[Vec<f64>]) -> f64 {
                 b += 1;
             }
             let m = sm[a..=b].iter().cloned().fold(0.0, f64::max);
-            if m > 0.02 {
+            if m > 0.02 && m <= OSD_DARK_MAX {
                 let hi: Vec<usize> = (a..=b).filter(|&i| sm[i] >= 0.5 * m).collect();
                 above += p[a..hi[0]].iter().sum::<f64>();
                 below += p[hi[hi.len() - 1] + 1..=b].iter().sum::<f64>();
@@ -920,18 +939,24 @@ fn osd_eval(data: &Arc<Vec<u8>>, n: usize) {
     let ev = |k: &str, d: usize| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
     let (ka, kd, tile) = (ev("BITONAL_OSDKA", OSD_KA), ev("BITONAL_OSDKD", OSD_KD), ev("BITONAL_OSDTILE", OSD_TILE));
     let tess = std::env::var_os("EVAL_TESS").is_some();
+    let upright = std::env::var_os("EVAL_UPRIGHT").is_some(); // pages known to be upright (#45): no Tesseract truth
     let rows = par_pages(data, n, |p, i| {
         let (g, _) = page_gray(p, 300.0, false);
         let g = Img { w: g.w as usize, h: g.h as usize, px: g.px.iter().map(|&v| v as f32 / 255.0).collect() };
-        let up = rot90(&g, osd(&g));
+        let up = if upright { g } else { rot90(&g, osd(&g)) };
         (0..4).map(|q| {
             let r = q * 90;
             let x = rot90(&up, r);
             let t0 = Instant::now();
-            let (d, c) = osd_own(&x, ka, kd, tile);
+            let (d, ratio, asym) = osd_parts(&x, ka, kd, tile);
+            let c = ratio * asym.abs();
             let own_ms = t0.elapsed().as_millis();
             let (t, tms) = if tess { let t0 = Instant::now(); (osd(&x) as i64, t0.elapsed().as_millis()) } else { (-1, 0) };
-            format!("page {} turn {r} expect {} own {d} conf {c:.2} own_ms {own_ms} tess {t} tess_ms {tms}", i + 1, (360 - r) % 360)
+            format!(
+                "page {} turn {r} expect {} own {d} conf {c:.2} ratio {ratio:.2} asym {asym:.3} own_ms {own_ms} tess {t} tess_ms {tms}",
+                i + 1,
+                (360 - r) % 360
+            )
         }).collect::<Vec<_>>()
     });
     rows.into_iter().flatten().for_each(|l| println!("{l}"));
@@ -1243,8 +1268,8 @@ mod tests {
                 let (asc, desc) = (rnd() < 30, rnd() < 8);
                 let (top, bot) = (base - 20 - if asc { 14 } else { 0 }, base + if desc { 14 } else { 0 });
                 for y in top..bot {
-                    for x in x0..x0 + bw {
-                        px[y * w + x] = 0.0;
+                    for x in (x0..x0 + 2).chain(x0 + bw - 2..x0 + bw) {
+                        px[y * w + x] = 0.0; // two stems per letter: solid blocks are darker than text (OSD_DARK_MAX)
                     }
                 }
                 x0 += bw + 3 + rnd() as usize % 7;
@@ -1256,6 +1281,20 @@ mod tests {
             assert_eq!(d, (360 - q) % 360, "turn {q}");
             assert!(c >= OSD_OWN_MIN_CONFIDENCE, "confidence {c}");
         }
+    }
+
+    // One tile profile from a photographed page (#45, f7): an upright text line with a small ascender excess, then a
+    // dark book edge (fast rise to 0.7, long fade). The edge is not a text line and must not outvote it.
+    #[test]
+    fn direction_ignores_dark_edge() {
+        let mut p = vec![0.0; 96];
+        p[10..14].copy_from_slice(&[0.06, 0.09, 0.12, 0.15]); // ascenders
+        p[14..22].fill(0.25); // x-height band
+        p[22..25].fill(0.05); // descenders
+        for i in 60..96 {
+            p[i] = if i < 66 { 0.12 * (i - 59) as f64 } else { 0.7 - 0.02 * (i - 66) as f64 };
+        }
+        assert!(direction(&[p]) > 0.0);
     }
 
     // The fast blur equals the exact Gaussian within 0.1 % of the range, also at a dark edge band and the corners.
