@@ -368,8 +368,8 @@ is the only reason to trust it beyond these 47 pages.
 - **Real 90/180 scans, other scripts and fonts.** All five documents are Danish/Latin text, four of them one scanner and
   one book. The direction rule is a statement about Latin letter shapes (ascenders more frequent than descenders) and
   will not carry over to Cyrillic, Greek or CJK; the axis rule may. No non-Latin sample exists locally.
-- **Pages with little text** (figures, blank facing pages, title pages): the confidence gate is the only protection and
-  is untested. A whole-document vote (idea 3 in the issue: run on a few pages, apply the majority) was not needed for
+- **Pages with little text** (figures, blank facing pages, title pages): the confidence gate is the only protection;
+  tested on photographed material in #45 (below: 0 of 77 upright pages turned after the `OSD_DARK_MAX` fix). A whole-document vote (idea 3 in the issue: run on a few pages, apply the majority) was not needed for
   accuracy on this suite, and would be the next step if single pages turn out unreliable. It is a plan change, not a detector
   change, and would make a genuinely mixed document wrong.
 - **Mixed orientation on one page** (`ren pdf` p2) is unsolved by design: one quarter turn per page.
@@ -381,6 +381,61 @@ is the only reason to trust it beyond these 47 pages.
 Own detector as the default for `--rotate`: no system dependency, 186/188 on the local suite (misses: one ambiguous
 page), identical output to Tesseract on all six scans, 11× faster per page. The weak part is coverage of the test, not
 the numbers: five Latin documents and synthetic 90/180.
+
+### Photographed pages (#45)
+Section 4.3 found the detector turning 12 of the 77 upright pages of f1–f7 (photographed spreads, pictures, colour).
+New case set: those 77 pages, truth = as they are (all upright, 4.3), and their `rot90` copies → **308 cases**
+(`EVAL_UPRIGHT=1 bitonalpdf --osd-eval fN.pdf`: the page is taken as upright instead of asking Tesseract). The eval line
+now also prints the two parts of the confidence, `ratio` (axis) and `asym` (direction), so a miss can be assigned to a stage.
+
+**Cause (measured on f7 p5, per tile and per line).** The text tiles gave direction scores of about ±0.1 each; the bottom
+row of tiles, where the dark book edge/table is still inside the central 90 %, gave about −1.5 each and decided the page.
+There the "line" between two profile minima is the edge itself: peak darkness 0.71 against 0.20–0.23 for the text lines,
+running into the tile border, so its fading side counts as a huge descender. The same happens in the axis stage with
+pictures and dark picture borders (f1 p5, p22): their edges outweigh the few text lines. So the issue's first candidate
+(dark surround) and third (pictures read as text) are one mechanism. Lamp glow was not examined on its own: the fix below
+does not address it and f7 (the glow document) has no upright page turned after it.
+
+**Fix: one constant, `OSD_DARK_MAX` = 0.4.** Flattened darkness above it is not text. The axis stage leaves out every tile
+whose densest row or column is above it (for rows and columns alike, so the sample counts stay equal); the direction stage
+leaves out every line whose smoothed peak is above it. Nothing else changed: same stages, resolutions, gate 0.25.
+
+| (gate 0.25 = what `--rotate` does) | before | after |
+|---|---:|---:|
+| old suite (188, Tesseract truth) | 186 | **186** (same two `ren pdf` p2 misses) |
+| new, upright pages turned (of 77) | 14 * | **0** |
+| new, turned copies right / left as they are / turned wrong (of 231) | 101 / 111 / 19 | **150 / 80 / 1** |
+| new, detector alone without gate (of 308) | 178 | 275 |
+
+**Whole runs** (all four flags, f1–f7): main turns f1 p5/p22, f2 p10/15/16 and f7 p1/2/4–8 (the 12 of 4.3); after the fix no page is
+turned, the page counts are back at the Tesseract baseline (f1 50, f7 18), and **all seven outputs are byte-identical to
+`BITONAL_OSD=tesseract`** (`cmp`). `BIN=… SIZE_TOL=3 tests/real.sh`: same output as main (same two known `skewed`/`sidste` facts
+failures), the five written PDFs byte-identical. A page where every tile is too dark for text now returns 0° with confidence 0
+(without the guard 0/0 would give a NaN ratio, which `min(1e3)` turns into full confidence); no page of either suite hits it.
+
+\* 12 in the real runs of 4.3; two more sit at 0.25 when the confidence is rounded to two decimals as in the eval line.
+The one wrong turn left is f2 p1 at 90° (a cover). Per file after the fix, turned copies right (of 3 × pages): f1 62/75, f2 39/54,
+f3 24/27, f4 15/15, f5 9/21, f6 0/12, f7 1/27. Upright pages turned by gate: 0 at every gate from 0.2 to 0.6 (the old suite stays
+at 186 for gates 0.2–0.3, 184 at 0.35). The cap: 0.3, 0.35 and 0.4 all give 0 upright turned; old 184 / 186 / 186 and turned copies right
+162 / 159 / 150. 0.35 and 0.4 both hold 186 for gates 0.2–0.3; 0.4 was kept as the value furthest from the text peaks. Detection time unchanged (same run, same load: 202 vs 205 ms old, 281 vs 274 ms new).
+
+`cargo test`: `direction_ignores_dark_edge` (one tile profile: a text line plus an f7-shaped edge; fails without the cap).
+`orientation_found_for_all_turns` now draws each synthetic letter as two 2-px stems instead of a solid block: solid
+blocks at ~60 % coverage are darker than any text line (0.2–0.3 at 75 dpi) and were capped away.
+
+What it does not do: on photographed material the detector is now **safe but not useful for real turned pages**:
+of the 231 turned copies, 80 are left as they are (f6 0/12, f7 1/27 right). A photographed book that actually needs turning
+still needs `BITONAL_OSD=tesseract`. The cap also means very dense or bold text (line peak above 0.4 at 75 dpi) no longer votes;
+the old suite did not change, but a page of heavy headings could fall back to 0°.
+
+What did not work (all at gate 0.25 or raw, same 188 + 308 cases):
+- **Detrending each line** (measure above/below the straight line between the two bounding minima, against glow gradients):
+  worse everywhere, new 123/308 raw (from 178), old 151/188.
+- **Skipping lines cut by the tile border** (no minimum at one end): new 198/308, f7 still 6/36; the edge line is not always cut.
+- **Skipping tiles by mean darkness** in the axis stage (0.1–0.3): f1 raw 47–55 of 100 (from 48); the picture tiles are not dark on
+  average, their edges are. The max-row/column rule above is what fixed f1 (raw 48 → 94 of 100).
+- **Raising the gate** alone: 0 upright turned needs 0.45, which costs the old suite 9 cases (177/188).
+- **A whole-document vote** was not tried: f7 had 8 of 9 pages wrong the same way, so a vote would have followed the error.
 
 ## 4. B4 groundwork: material, baseline, codecs, signals (#43)
 
@@ -497,6 +552,7 @@ Things the table hides, each measured:
    on the contact sheet of f7). It also changes the split decisions (f1 48 vs 50 pages, f7 17 vs 18), which is why the `text + Tess` rows are the ones to compare with `images`
    (50 and 18 pages). So section 3's "186/188" was measured on five Latin documents rotated by `rot90`; on photographed pages with dark surroundings and on
    picture/colour pages it does not hold. Not investigated why (unverified: dark surround, orange glow, large pictures counted as text lines).
+   **Fixed in #45** (section 3, "Photographed pages"): dark edges and pictures were read as text lines; after the fix 0 of the 77 are turned.
 2. **Text mode destroys pictures, as expected:** f1's paintings and photos become black/white blotches, and some full-bleed picture pages come out nearly blank (seen on the contact
    sheet of f1 output pages 9–16; unverified why: the flatten divides a uniform area by its own blur), coloured elements become grey on white. This is the case the mixed mode is for.
 3. **f6 (dark table, photographed A3): both modes split wrongly.** 3 of 4 spreads have no confident gutter; the median fallback cuts them, giving 8 pages, several of them
@@ -674,7 +730,7 @@ Still missing (for #38 / later):
 - Output/input is 0.085–0.38 for text and 0.28–1.47 for images; the images output is 3.3–4.7× the text output on every file (f1 3.3×, f2 3.8×, f3 3.9×, f4 3.5×, f5 3.8×, f6 3.7×, f7 4.7×).
 - Chroma signals are cheap and separate colour pictures from body text well on colour scans; they say nothing on 1-bit/grey pages (25 of 77 here), where the tool has no colour to keep anyway.
 - The hard pairs are diagram vs coloured text and picture vs diagram; the labels for those are the least certain.
-- Detection would also have to survive the pipeline's own weak spots seen in 4.3: wrong orientation (12 pages), wrong splits on the dark-table photographs (f6), and the flatten blanking full-bleed pictures.
+- Detection would also have to survive the pipeline's own weak spots seen in 4.3: wrong orientation (12 pages; fixed in #45), wrong splits on the dark-table photographs (f6), and the flatten blanking full-bleed pictures.
 
 ## 5. B4 decision: mixed output (#38)
 
@@ -827,8 +883,8 @@ page, measured in the audit run under load; 6–7 s wall idle), ≤ +28 % CPU on
 it: perfect regions beat perfect pages by only 5 % (5.4), and no tile cut is both safe and cheap (5.1).
 
 Prerequisites before implementing:
-1. **Orientation** (#45): 12 of 77 upright pages turned by the own detector, 8 of them colour pages; until fixed, mixed runs must use
-   `BITONAL_OSD=tesseract` or no `--rotate`.
+1. ~~**Orientation** (#45)~~: done, 0 of 77 upright pages turned (section 3, "Photographed pages"). Photographed pages that really are
+   turned are mostly left as they are by the own detector; use `BITONAL_OSD=tesseract` for those.
 2. **Crop box vs pictures** and the dark-table splits (#46): the crop cuts 8 of 46 labelled regions by 17–45 %.
 3. **#40** merged, so the bash reference (MODE=images) is right.
 4. **A Rust JPEG page** (the images part of #9, or the first issue below) with the `jpeg-encoder` licence note.
