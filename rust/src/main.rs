@@ -46,6 +46,12 @@ const GUTTER_MIN_INK_ROWS: u32 = 2;
 const GUTTER_TRUST_FRAC: f64 = 0.08;
 const GUTTER_VALLEY_RATIO: f64 = 0.5;
 const GRID_ROWS: usize = 48;
+// Dark edge artefact (#53): after closing pinholes, a connected piece this tall (fraction of the slot height) and this
+// narrow, in the outer zone (fraction of the width). Text never makes a component that tall.
+const BAND_MIN_HEIGHT_FRAC: f64 = 0.6;
+const BAND_MAX_WIDTH_FRAC: f64 = 0.3;
+const BAND_ZONE_FRAC: f64 = 0.35;
+const BAND_CLOSE: usize = 3; // px at the output dpi
 const CROP_MIN_DENSITY: f64 = 0.03;
 const CROP_MAX_DENSITY: f64 = 0.55;
 const CROP_MIN_RUN: f64 = 0.005;
@@ -402,7 +408,8 @@ fn finish(page: &Page, i: usize, m: &Meta, plan: Plan, (tw, th): (i64, i64), cfg
             if cfg.slot_flat {
                 c = flatten(&c, BLUR_SIGMA);
             }
-            let bits = hyst(&c, cfg.thresh);
+            let mut bits = hyst(&c, cfg.thresh);
+            clear_edge_bands(&mut bits, c.w, c.h);
             (c.w as u32, c.h as u32, encode_g4(&bits, c.w as u32))
         })
         .collect();
@@ -630,6 +637,51 @@ fn rotate(g: &Img, deg: f32, cw: usize, ch: usize, fill: f32) -> Img {
         }
     }
     Img { w: cw, h: ch, px }
+}
+
+/// A spine shadow, book edge or the rules next to it (#53) is one connected piece running most of the slot height,
+/// often slanted or bowed; text never is. Whiten such pieces in the outer zone of the slot.
+// ponytail: whitens the piece only; a crop or an alignment step (#55) would also move the text
+fn clear_edge_bands(bits: &mut [bool], w: usize, h: usize) {
+    let r = BAND_CLOSE;
+    // close pinholes: dilate by r, sideways then down
+    let mut d = vec![false; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            d[y * w + x] = bits[y * w + x.saturating_sub(r)..(x + r + 1).min(w) + y * w].contains(&true);
+        }
+    }
+    let mut c = vec![false; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            c[y * w + x] = (y.saturating_sub(r)..(y + r + 1).min(h)).any(|k| d[k * w + x]);
+        }
+    }
+    let (lab, comps) = components(&c, w, h);
+    // bounding box per root: x0, x1, y0, y1
+    let mut bb = vec![[usize::MAX, 0, usize::MAX, 0]; comps.len()];
+    for y in 0..h {
+        for x in 0..w {
+            if c[y * w + x] {
+                let b = &mut bb[lab[y * w + x] as usize];
+                *b = [b[0].min(x), b[1].max(x), b[2].min(y), b[3].max(y)];
+            }
+        }
+    }
+    let (wf, hf) = (w as f64, h as f64);
+    let hit: Vec<bool> = bb
+        .iter()
+        .zip(&comps)
+        .map(|(b, k)| {
+            k.0 > 0 && (b[3] - b[2] + 1) as f64 >= BAND_MIN_HEIGHT_FRAC * hf && ((b[1] - b[0] + 1) as f64) < BAND_MAX_WIDTH_FRAC * wf
+                && ((b[1] as f64) < BAND_ZONE_FRAC * wf || (b[0] as f64) > (1.0 - BAND_ZONE_FRAC) * wf)
+        })
+        .collect();
+    for i in 0..w * h {
+        if bits[i] && c[i] && hit[lab[i] as usize] {
+            bits[i] = false;
+        }
+    }
 }
 
 /// Sub-image [x0,x1) x [y0,y1), clamped to the image.
@@ -1228,6 +1280,32 @@ mod tests {
         let (g, src) = page_gray(page, dpi, true);
         assert_eq!((src, g.w, g.h), ("image", w, h));
         assert!(g.px.iter().zip(&bits).all(|(&p, &b)| (p < 128) == b));
+    }
+
+    // A slanted, dithered dark band at the slot edge is whitened (#53), no single column of it reaches half the height;
+    // a text-like left margin (short stems) and text are kept.
+    #[test]
+    fn edge_band_cleared_text_kept() {
+        let (w, h) = (400usize, 480usize);
+        let mut bits = vec![false; w * h];
+        for y in 0..h {
+            let x0 = 20 + y / 24; // slants 20 px over the height
+            for x in x0..x0 + 12 {
+                bits[y * w + x] = (x + y) % 5 != 0; // dithered
+            }
+            if y % 20 < 8 {
+                for x in 100..108 {
+                    bits[y * w + x] = true; // margin stems
+                }
+                for x in 150..300 {
+                    bits[y * w + x] = y % 3 == 0;
+                }
+            }
+        }
+        let before = bits.clone();
+        clear_edge_bands(&mut bits, w, h);
+        assert!((0..h).all(|y| (0..60).all(|x| !bits[y * w + x])));
+        assert!((0..h).all(|y| (60..w).all(|x| bits[y * w + x] == before[y * w + x])));
     }
 
     // Text-like lines skewed by +2° (falling to the right): skew_angle finds it, and rotate by that angle

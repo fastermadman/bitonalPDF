@@ -972,5 +972,39 @@ the six older scans are otherwise unchanged.
   a deskew cap: the 10° slots were the table slivers.
 - **Dark spine/edge bands remain** on some split pages (f1 output p13, also on main, and p43, which is a page that
   main didn't produce correctly at all). They sit between the cut and the text. That is a crop question for the slot,
-  not a gutter one.
+  not a gutter one. Measured and partly fixed in #53 (section 7); the rest is #55.
 - The single-page median box for portrait pages among spreads (#46 comment) wasn't hit by any file and wasn't measured.
+
+## 7. Dark edge bands in the slot (#53)
+
+### Measurement (f1 output p13, 300 dpi, after the #46 fix)
+Per column: nothing to x 190, then a band at 200–290 (ink 0.2–0.46 of the rows), a gap, a dotted rule at 320–340,
+a gap to ~500 where the text starts. The band runs the whole height (rows 115–2858) but is **slanted/bowed**: no single
+column has ink in more than 26 of 48 row bands. It is not a spine shadow in the middle but the book edge on the
+outer side of the slot, and on f1 it is on nearly every left slot (22 of 50 output pages), also on f3 (7 pages) and
+f7 (6 pages), a black edge line or rules next to it.
+
+### What did not work
+A column rule (a run of columns with ink in ≥ 80 % of the row bands): the slant makes every column too thin, even with
+pinholes closed sideways. It also changed f4/f5, which have no band.
+
+### What was built
+`clear_edge_bands`: close 3 px pinholes, take 8-connected components, and whiten the ink of every component that is at
+least 60 % of the slot height, narrower than 30 % of its width and lies in the outer 35 % of it. Text never makes a
+component that tall. The slot size is unchanged (whitening, not cropping, so all pages stay one size).
+
+### Result (all four flags)
+| | before | after |
+|---|---|---|
+| pages with such a tall edge piece (100 dpi scan) | f1 22, f2 1, f3 7, f7 6 | f1 1, f2 1 |
+| f2, f4, f5, f6 | | byte-identical |
+| f1 p13, f3 p9, f7 p7 | band / edge line | gone, text and picture intact (looked at) |
+| f1 p19, f2 p1 | picture frame, cover | unchanged (not bands) |
+| `cargo test` | 7/7 | 8/8 (`edge_band_cleared_text_kept`) |
+| `BIN=… SIZE_TOL=3 tests/real.sh` | same failures as main | unchanged |
+
+### Not fixed
+- **f1 p43**: the thin rules go, but the wedge at the top and the arc at the bottom are joined to the page edge, so
+  the component is wider than 30 % of the slot and is left alone. The text of p43 is not touched.
+- Whitening leaves the box where it was; text is not centred or aligned across pages. Order of passes, cropping vs
+  whitening and alignment are #55.
