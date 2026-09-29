@@ -801,6 +801,7 @@ detection. Automatic detection is only a *suggestion* (5.2), never the default a
 
 The damage of a miss is irreversible in the output (the figure is gone; only the input keeps it), the cost of a false alarm is bytes. So:
 - **Default: unchanged.** `MODE=text` stays text; nothing is coloured unless asked. [estimate: a judgement, from the table]
+  **Superseded by section 9 (#74):** with information over size, the default is every RGB-source page as a JPEG page, printed.
 - **Override / the mechanism:** `--colour-pages LIST` keeps the listed pages as MODE=images pages inside a text-mode PDF. LIST names input pages,
   with an optional half (`12` = both halves, `12a`/`12b` = left/right, as bash names its slots): colouring whole input pages instead of the
   labelled halves costs 12.72 vs 10.87 MB (2.14× vs 1.83× text; f7 2.47 vs 1.87 MB) [measured, labels?].
@@ -1194,3 +1195,147 @@ changed (f5 p1 has no page number).
 - Readability is `checker`'s judgement at 100 dpi, not a number.
 - `BITONAL_WHITENED=1` lists both `keep_box` passes for a cover slot.
 - The text/fill colours in the source were not measured (luma only).
+
+## 9. B4c: colour policy with information over size (#74)
+
+Question: what keeps colour or grey, and who decides (user, automatic, automatic with a printed suggestion), now that
+**keeping information matters more than the smallest file**. §5 decided the same with bytes as the cost. Tags as in §5:
+**[measured]**, **[estimate]**, **[unknown]**, **[labels?]**, **[scans]**. Nothing in the pipeline changed.
+
+### 9.0 Measurements
+Reproduce (`D="tests/real/new pdfs dont upload"`, `W="$D/work"`; outputs in `$W/m3/`, git-ignored):
+```
+python3 tests/mixed-eval.py $W/det.tsv "$D" $W/m3/geom.txt $W/m3/slots.txt $W/base $W/m3/base40 --policies   # ~21 s (M1, M2)
+python3 tests/ink-colours.py $W/det.tsv "$D" $W/m3/geom.txt                                                   # ~15 s (M3)
+```
+- **M1** (`--policies`): size and region outcome per page-list policy. Region outcome over the 46 labelled regions plus f7 p7
+  (keep page without a box, counted as one page-sized coloured-text region) = 47: *kept* (every output slot it touches is a
+  JPEG page), *partial*, *lost* (a picture or cover left as 1-bit), *degraded* (a diagram or coloured text left as 1-bit,
+  SSIM 0.79–0.85 in §5.2). The crop-box loss (8 of 46 regions cut by 17–45 %, §5.1) hits every policy alike and is not in these counts.
+  Cuts leave-one-file-out as §5.1. The existing rows reproduce §5.6 exactly (5.93 / 10.87 / 12.72 / 15.94 / 14.89 MB).
+- **M2** (in `--policies`): every MODE=images page JPEG re-encoded q65 as colour 4:2:0 and as luma, from the same page JPEG.
+- **M3** (`tests/ink-colours.py`, new): per RGB-source input page (inside the pass-A crop box, 150 dpi) and per labelled box:
+  number of hue clusters of colour pixels (chroma ≥ 60), hue concentration, colour area, luma spread of the colour pixels,
+  distance to a 4-colour k-means fit (flat vs continuous colour), tinted share of light pixels (the pale box of §5.9 2c).
+  Question: pages whose only non-text content is coloured text (P, 7) vs pages with a picture, diagram or cover (N, 29);
+  text-only RGB pages (T, 16) shown at the same cut.
+- **M5 not done** (text legibility on colour pages, JPEG 150 dpi vs G4 300 dpi, by Tesseract word agreement). It could only
+  reopen MRC/region layers, which need a region detector that does not exist (§5.1); several sources are themselves
+  150–200 ppi JPEGs (f5, f6), so 300 dpi gains little there; and OCR agreement on Danish scans is a noisy proxy. [unknown]
+
+### 9.1 The candidates
+Level × treatment, where numbers exist (✔ in §4–5 or 9.0, ◐ crop or single point only, ✗ none):
+
+| | 1-bit G4 | grey JPEG | colour JPEG q65/150 | mask + colours | MRC | #71 cover threshold |
+|---|---|---|---|---|---|---|
+| output slot | ✔ | ✔ (M2) | ✔ | ◐ 2 crops (§5.3) | ✗ | ◐ f5 p1 only |
+| whole input page | – | ✔ (M2) | ✔ | ✗ | ✗ | – |
+| region | – | ✗ | ✔ (§5.4) | ✗ | ◐ MRC-lite crop, viewers ok | – |
+| document mode | ✔ | ✔ (M2) | ✔ | – | – | – |
+
+Page-level policies (M1) [measured, labels?, scans]; "text slots in colour" = JPEG output pages with no keep content (of 66):
+
+| policy | decided by | size | × text | JPEG pages | text slots in colour | kept / lost / degraded (of 47) | not kept | grey instead of colour |
+|---|---|---:|---:|---:|---:|---|---|---:|
+| D0 text only (today) | user list | 5.93 MB | 1.00 | 0 | 0 | 0 / 22 / 25 | every region | – |
+| label list (reference, a perfect list) | – | 10.87 MB | 1.83 | 42 | 0 | 47 / 0 / 0 | – | 1.74× |
+| D1 `auto`, tiles in crop box, R 0.99 | automatic | 15.94 MB | 2.69 | 91 | 29 | 47 / 0 / 0 | – | 2.54× |
+| D1′ tiles R 0.8 | automatic | 14.89 MB | 2.51 | 84 | 24 | 45 / 0 / 2 | f1 p1 diagram?, f1 p2 coloured text? | 2.37× |
+| D2 page `hasler` (cut = lowest keep page of the other six files) | automatic | 14.28 MB | 2.41 | 75 | 17 | 45 / 0 / 2 | same two | 2.28× |
+| **D3 every page whose source is RGB** | the source | 15.94 MB | 2.69 | 91 | 29 | 47 / 0 / 0 | – | 2.54× |
+| D4 document mode: D2 share ≥ 0.5 → all JPEG, else D2 | automatic | 16.86 MB | 2.84 | 99 | 37 | 47 / 0 / 0 | – | 2.69× |
+| D4 with share ≥ 0.8 | automatic | 14.28 MB | 2.41 | 75 | 17 | 45 / 0 / 2 | as D2 | 2.28× |
+| D5 input page 1 only | position | 7.16 MB | 1.21 | 11 | 2 | 6 / 18 / 23 | all but the covers | 1.19× |
+| D2 + D5 | automatic | 14.51 MB | 2.44 | 77 | 17 | 46 / 0 / 1 | f1 p2 coloured text? | 2.31× |
+
+(? = uncertain label. D2 shares per file: f1 0.60, f2 0.28, f3 0.11, f4 0.60, f5–f7 1.00; with n = 7 files the document
+cut is a sanity check, not an estimate.)
+
+- **D1 and D3 choose exactly the same 91 output pages** [measured]: at R 0.99 the tile detector flags every RGB-source slot
+  on this material. D3 gets the same result with no detector. Whether they differ elsewhere is [unknown] (#47).
+- **The #66 cover signal** catches 1 of 4 covers (f5 p1, §8) and **page 1** is a cover in 4 of 7 files (f2, f3, f5, f7);
+  neither is a policy on its own, and D2 + D5 only recovers f1 p1.
+- **Grey JPEG saves 4 %** against colour (per file 0.94–0.99, re-encoded colour / original 1.02) [measured]. At 4:2:0 the
+  chroma is a small part of a JPEG; grey pays with the hue (a pie chart's legend) for almost no bytes. Grey only makes sense
+  where the source is grey, and there the colour JPEG is grey anyway.
+- **The #71 cover threshold** stays what it is: the text-mode rendering of a cover. As a colour treatment it has no role
+  once covers are JPEG pages.
+
+Per candidate, how it fails (FN = a keep page left 1-bit, FP = a text page as JPEG) and whether the user can undo it:
+
+| candidate | FN | FP | needs | undo |
+|---|---|---|---|---|
+| D0 | every figure (22 lost, 25 degraded) | – | nothing | `--colour-pages LIST` (#76) |
+| D1 | pages without one flagged tile; none here | 29 text slots, +114 kB each, no damage | #75, #76, detector + a decision column in `--detect-eval` | printed list, LIST / `none` |
+| D2 | f1 p1, p2 (pale colour: no pixel with chroma ≥ 60, M3) | 17 text slots | #75, #76, `hasler` per page | printed list |
+| D3 | a figure on a 1-bit or grey source page (none here; the grey engraving f1 p17 is on an RGB page) | 29 text slots | #75, #76, the source's colour space | printed list |
+| D4 | a file with few figures and low share keeps only D2's pages | whole files as JPEG (f5–f7 here, 37 text slots) | as D2 | a per-file flag |
+| mask + colours | – | a picture becomes a silhouette (SSIM 0.55–0.59, §5.3) | a signal (M3: none), a new page type | only if printed |
+| MRC / regions | a third of the regions at a low FP rate (§5.1) | FP boxes on all 16 RGB text pages | region detector, layers | no (not a page list) |
+
+### 9.2 Ink colours and flat colour (M3; §5.9 item 2)
+[measured, labels?, scans] Each signal alone, leave-one-file-out. *Safe cut* = no N page of the six training files passes
+(the §5.1 logic: a picture must never become a silhouette); *balanced* = best balanced accuracy on the six.
+
+| signal | AUC P vs N | per file [min–max, files] | safe cut: P / N / T passed | balanced: P / N / T |
+|---|---:|---|---:|---:|
+| hue clusters k | 0.64 | 0.67–0.96, 3 | 0/7 / 0/29 / 0/16 | 5/7 / 14/29 / 13/16 |
+| hue concentration (top two 30° windows) | 0.65 | 0.55–0.96, 3 | 0/7 / 1/29 / 0/16 | 2/7 / 18/29 / 14/16 |
+| colour area | 0.80 | 0.80–0.93, 3 | 0/7 / 1/29 / 8/16 | 6/7 / 10/29 / 16/16 |
+| luma spread of colour pixels | 0.51 | 0.70–0.96, 3 | 0/7 / 3/29 / 2/16 | 0/7 / 6/29 / 9/16 |
+| 4-colour fit distance | 0.57 | 0.60–0.96, 3 | 0/7 / 1/29 / 0/16 | 1/7 / 18/29 / 9/16 |
+| tinted paper | 0.82 | 0.75–0.93, 3 | 1/7 / 1/29 / 8/16 | 3/7 / 8/29 / 16/16 |
+
+Labelled boxes (12 coloured text vs 34 picture/diagram/cover, signals inside the box): AUC 0.57–0.72, safe cut 0/12 on every signal.
+
+- **No signal gates mask + colours.** The safe cut passes 0–1 of 7 coloured-text pages and still lets a picture through;
+  the balanced cut turns 6–18 of 29 figure pages into silhouettes.
+- **Number of ink colours:** P pages have k = 0–2, N pages 0–3, text-only pages 0–3. f7 shows blue (205°) and orange
+  (15–25°) as §5.9 said; the pale green box has chroma below 60 and shows only as tint.
+- **Why** [measured values, the reading is an estimate]: flatness works on the flatbed scan (f5: coloured heading 0.015,
+  pictures 0.06–0.13) but not on the photographed files, where coloured-text pages sit at 0.09–0.14 like pictures. A warm hue
+  at 15–45° appears on nearly every photographed page (paper tint under the photo light, the f7 lamp glow; not verified).
+  f1 p1 and p2, D2's two misses, have no pixel at chroma ≥ 60 at all.
+- **Observation, not tested:** a flat diagram (f5 p4 pie chart, fit 0.015) would suit mask + k colours as well as coloured
+  text does, so the useful border may be flat vs continuous rather than coloured text vs the rest. That grouping was made after
+  seeing the numbers; it needs the #47 sources.
+
+### 9.3 What the new priority changes in §5, and what not
+- **§5.2 default: changes.** §5.2's asymmetry (a miss is irreversible, a false alarm costs bytes) already pointed recall-first;
+  the text-only default was a judgement on bytes. With information first, the default becomes a recall-first page list that
+  is **always printed**, with `--colour-pages LIST` and `none` as the override.
+- **§5.7: `auto` moves** from a printed suggestion to the default, and prerequisite 2 (the crop box cuts 8 of 46 regions,
+  covers 27–45 %) rises from a flaw to an information loss in every policy: #76's crop decision for listed pages is now the
+  largest remaining loss.
+- **§5.3 mask + colour: weaker.** It drops the fill of coloured boxes (a loss) and M3 found no signal to gate it.
+- **Unchanged:** §5.1 (no usable tile cut, one class), §5.4 (region layers/MRC rejected on a 5 % gain; information would only
+  reopen them if 150-dpi JPEG text proves to lose content, M5), §5.5 codec (JPEG q65 150 dpi; grey not worth it, M2).
+- **Not tried, and why not worth it here: HDR-style fusion** (several synthetic exposures of one scan, merged). The input is one
+  8-bit capture, so synthetic exposures add no information; for JPEG pages there is nothing to recover. The 1-bit analogue is
+  real, though: §8's #71 shows one blur width cannot keep both white-on-fill text (σ 1000) and photo tones (σ 30). Choosing per
+  component between thresholds at several blur widths is exposure fusion for bits; it belongs to text mode (B2, covers), not
+  to this policy. Not measured.
+
+### 9.4 Recommendation
+**D3: a slot is a JPEG page when its source page is RGB, otherwise G4; the list is printed; `--colour-pages LIST|none`
+overrides.** 2.69× text, all 47 regions kept, 29 of 66 text slots in colour, no detector [measured, labels?, scans].
+It is the simplest rule that loses nothing here, it is predictable (the user can tell from the source why a page is in colour),
+and it inherits no detector error.
+
+Alternatives:
+1. **D2 page `hasler`:** 2.41× (−10 % against D3), 12 fewer text slots in colour, but degrades f1 p1 and p2 (pale colour,
+   both uncertain labels). The pick if size must still count a little.
+2. **D1 `auto`:** identical to D3 here and needs the detector; only worth it if #47 shows RGB-source text pages to be common
+   *and* the detector to skip them without losing figures (§5.7: FP rate < 0.05 at no lost region on a held-out source).
+
+Where D3 fails: an all-RGB colour scan of a plain text book becomes MODE=images (3.5×, no loss); a figure on a 1-bit or
+grey source page stays 1-bit (the list fixes it). Unverifiable here: seven scans of one owner's books, one labeller (me),
+19 uncertain pages, no rendered pages with figures, no back covers, one grey picture, one cover that fires #66; #47 is missing.
+
+### 9.5 Issues this implies
+- **B4d (#75):** unchanged, no luma page needed (M2).
+- **B4e (#76):** add `none`, and the default list comes from the policy (D3), printed like the gutter warning; the crop
+  decision for listed pages is the top priority there (covers lose 27–45 %).
+- **New:** default policy D3 (+ printed list), after #75/#76; re-measure D1/D2/D3 on the #47 sources before release.
+- §5.7 conditional issues 3 (`auto` detector) and 4 (coloured text as G4 + colour) stay conditional; issue 4 now also needs
+  the flat-vs-continuous signal of 9.2 on non-photographed sources.
