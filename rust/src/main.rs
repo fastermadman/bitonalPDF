@@ -69,6 +69,7 @@ const CROP_PAD_FRAC: f64 = 0.012;
 const KEEP_FRAME_FILL: f64 = 0.1; // keep_box: a piece with less ink than this share of its box is a frame/edge candidate
 const KEEP_ZONE_D: f64 = 12.0; // keep_box: sideways reach on the header/footer line, in letter heights
 const KEEP_HEAD_D: f64 = 24.0; // keep_box: sideways reach on the block's top/bottom kept line, in letter heights (f1 p3: 18)
+const KEEP_EDGE_MAX: usize = 16; // keep_box: more big pieces than this touching a cut side switch the edge rule off (cover, #66)
 const KEEP_RULE_FRAC: f64 = 0.25; // keep_box: a thin piece longer than this share of the slot height is a rule (f7 p4's bar is shorter)
 const TIGHT_RIM: f32 = 0.03; // --crop: white rim around a slot before its box is measured (> CROP_EDGE_FRAC)
 const BLUR_SIGMA: f32 = 30.0; // px at the output dpi, like bash's -blur 0x30
@@ -484,7 +485,9 @@ fn finish(page: &Page, i: usize, m: &Meta, plan: Plan, (tw, th): (i64, i64), cfg
 /// when it is a letter above/below the text block within KEEP_ZONE_D letters sideways (a page number beside the head).
 /// Never kept: big sparse pieces reaching out of the block (book edges, frames); pieces bigger than 3 letters within
 /// 2 px of a cut side of the slot (`near_edge`), or thin and longer than KEEP_RULE_FRAC of it, unless they reach the
-/// middle half of the block. Everything not kept is whitened; returns the kept box, padded like content_box.
+/// middle half of the block, or unless more than KEEP_EDGE_MAX big pieces touch a cut side (a cover: the edge rule is off,
+/// #66; the threshold is a rule of thumb measured on f1-f7).
+/// Everything not kept is whitened; returns the kept box, padded like content_box.
 // ponytail: distance to the kept box, not to each component: a big picture's box can pull in scraps beside it
 fn keep_box(bits: &mut [bool], w: usize, h: usize, a: [usize; 4], near_edge: &dyn Fn(usize, usize) -> bool, dmul: f64, log: Option<(usize, usize)>) -> [usize; 4] {
     let (lab, comps) = components(bits, w, h);
@@ -511,6 +514,10 @@ fn keep_box(bits: &mut [bool], w: usize, h: usize, a: [usize; 4], near_edge: &dy
     hs.sort_unstable();
     let l = hs.get(hs.len() / 2).copied().unwrap_or(h / 100).max(1) as f64;
     let d = (dmul * l) as usize;
+    // a book edge is a few long pieces; many big pieces touching a cut side are content running off it (a cover, f5 p1)
+    // ponytail: a count, measured 26 on f5 p1 and at most 12 elsewhere on f1-f7; a cover with fewer stays whitened
+    let big_edge = (0..n).filter(|&i| edge[i] && (bb[i][2] - bb[i][0]).max(bb[i][3] - bb[i][1]) as f64 > 3.0 * l).count();
+    let runs_off = big_edge > KEEP_EDGE_MAX;
     let (ex0, ey0, ex1, ey1) = (a[0].saturating_sub(d), a[1].saturating_sub(d), a[2] + d, a[3] + d);
     let reason = |i: usize| -> Option<&'static str> {
         let b = &bb[i];
@@ -522,7 +529,7 @@ fn keep_box(bits: &mut [bool], w: usize, h: usize, a: [usize; 4], near_edge: &dy
             && !(b[0] >= ex0 && b[1] >= ey0 && b[2] <= ex1 && b[3] <= ey1);
         let rule = bh as f64 > KEEP_RULE_FRAC * h as f64 && bw * 8 < bh;
         let big = bw.max(bh) as f64 > 3.0 * l;
-        if frame { Some("frame") } else if meets(b, &core) { Some("not joined") } else if edge[i] && big { Some("edge+big") } else if rule { Some("rule") } else { Some("not joined") }
+        if frame { Some("frame") } else if meets(b, &core) { Some("not joined") } else if edge[i] && big && !runs_off { Some("edge+big") } else if rule { Some("rule") } else { Some("not joined") }
     };
     let live: Vec<bool> = (0..n)
         .map(|i| {
@@ -534,7 +541,7 @@ fn keep_box(bits: &mut [bool], w: usize, h: usize, a: [usize; 4], near_edge: &dy
             let rule = bh as f64 > KEEP_RULE_FRAC * h as f64 && bw * 8 < bh;
             // at a cut side only big pieces are junk: a page number can sit right on the pre-crop's edge (f1 p3, flerspaltet p9)
             let big = bw.max(bh) as f64 > 3.0 * l;
-            comps[i].0 > 0 && !frame && (meets(b, &core) || !((edge[i] && big) || rule))
+            comps[i].0 > 0 && !frame && (meets(b, &core) || !((edge[i] && big && !runs_off) || rule))
         })
         .collect();
     let mut kept = vec![false; n];
