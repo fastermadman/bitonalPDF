@@ -66,6 +66,7 @@ const CROP_EDGE_FRAC: f64 = 0.015;
 const CROP_PAD_FRAC: f64 = 0.012;
 const KEEP_FRAME_FILL: f64 = 0.1; // keep_box: a piece with less ink than this share of its box is a frame/edge candidate
 const KEEP_ZONE_D: f64 = 12.0; // keep_box: sideways reach on the header/footer line, in letter heights
+const KEEP_HEAD_D: f64 = 24.0; // keep_box: sideways reach on the block's top/bottom kept line, in letter heights (f1 p3: 18)
 const KEEP_RULE_FRAC: f64 = 0.25; // keep_box: a thin piece longer than this share of the slot height is a rule (f7 p4's bar is shorter)
 const TIGHT_RIM: f32 = 0.03; // BITONAL_SLOTBOX: white rim around a slot before its box is measured (> CROP_EDGE_FRAC)
 const BLUR_SIGMA: f32 = 30.0; // px at the output dpi, like bash's -blur 0x30
@@ -536,8 +537,14 @@ fn keep_box(bits: &mut [bool], w: usize, h: usize, a: [usize; 4], near_edge: &dy
     if k[2] == 0 {
         return a; // nothing in the block (blank slot): keep the block's box, whiten nothing
     }
+    // pass 0 grows the kept box; pass 1 adds head-line letters once and does not iterate, or a rule beside a page number
+    // would be pulled in by the enlarged box (f1 p5)
+    for head_pass in [false, true] {
     loop {
         let mut grew = false;
+        // top and bottom of the kept text lines: a dash or speck above the head must not move the head line
+        let kl = (0..n).filter(|&j| kept[j] && (bb[j][3] - bb[j][1]) as f64 >= l / 2.0);
+        let (top, bot) = kl.fold((usize::MAX, 0), |(t, u), j| (t.min(bb[j][1]), u.max(bb[j][3])));
         for i in 0..n {
             let b = bb[i];
             let (gx, gy) = (gap(b[0], b[2], k[0], k[2]), gap(b[1], b[3], k[1], k[3]));
@@ -547,16 +554,26 @@ fn keep_box(bits: &mut [bool], w: usize, h: usize, a: [usize; 4], near_edge: &dy
             // the head (f1 p3) or centred under a one-column last page (flerspaltet p9: 62 px beside, 886 px below).
             let letter = comps[i].0 as f64 >= l * l / 8.0 && ((b[2] - b[0]).max(b[3] - b[1]) as f64) <= 3.0 * l;
             let zone = b[3] <= a[1] || b[1] >= a[3];
+            // the block's top/bottom kept line (the running head): a letter on it may sit KEEP_HEAD_D letters out sideways
+            // (f1 p3 "14"), unless it is one of a dotted rule: >= 3 other narrow pieces in its columns (rule segments too) spread over KEEP_RULE_FRAC of h
+            let headline = head_pass && letter && (b[3] - b[1]) as f64 >= l / 2.0 && gx as f64 <= KEEP_HEAD_D * l && ((b[1] as f64) < top as f64 + 1.5 * l || b[3] as f64 > bot as f64 - 1.5 * l)
+                && {
+                    let st: Vec<usize> = (0..n).filter(|&j| j != i && bb[j][0] < b[2] && b[0] < bb[j][2]
+                        && comps[j].0 as f64 >= l * l / 8.0 && (bb[j][2] - bb[j][0]) as f64 <= 3.0 * l).collect();
+                    let (lo, hi) = st.iter().fold((b[1], b[3]), |(lo, hi), &j| (lo.min(bb[j][1]), hi.max(bb[j][3])));
+                    st.len() < 3 || (hi - lo) as f64 <= KEEP_RULE_FRAC * h as f64
+                };
             if live[i] && !kept[i]
-                && ((gx == 0 && comps[i].0 as f64 >= l * l / 8.0) || (gx <= d && gy <= d) || (zone && letter && gx as f64 <= KEEP_ZONE_D * l))
+                && if head_pass { headline } else { (gx == 0 && comps[i].0 as f64 >= l * l / 8.0) || (gx <= d && gy <= d) || (zone && letter && gx as f64 <= KEEP_ZONE_D * l) }
             {
                 add(i, &mut kept, &mut k);
                 grew = true;
             }
         }
-        if !grew {
+        if !grew || head_pass {
             break;
         }
+    }
     }
     for i in 0..w * h {
         if bits[i] && !kept[lab[i] as usize] {
