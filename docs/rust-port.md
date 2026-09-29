@@ -1135,3 +1135,62 @@ x ≈ 1615 is where the darker left circle ends and the lighter one starts, so t
 therefore the flatten (pass B, `BLUR_SIGMA`) plus the threshold, not the keep rule, `compose` or the box. Not checked: which of
 flatten and threshold alone would keep the text, and whether the rectangle's coordinates map exactly onto the issue's range.
 The `BITONAL_WHITENED` list proves `keep_box` only, not the whole pipeline. The dump code was temporary and is not in the tree.
+
+### Covers: flatten, not the threshold, whitens the circles (#71)
+
+**Cause measured, changed for covers.** The #70 rectangle (x 1620–2540, y 2720–3100) is in the pixels of the deskewed slot
+`c` (2649×3255), not of the composed canvas (2586×3193, offset keep − (31, 37)): with that mapping the dump reproduces #70
+exactly (4193 ink px after `hyst`, mean 232). Three dumps in `finish`, all sampled on `c`'s pixel grid (temporary code, not in
+the tree), f5 p1, all four flags:
+
+| stage | mean /255 | p5 / p50 / p95 | < 0.45 | < 0.60 | ink after `hyst` |
+|---|---|---|---|---|---|
+| D1 after `load` (before flatten) | 114.0 | 64 / 109 / 240 | 86.3 % | 92.5 % | 327 239 (93.6 %), `hyst` on it through the same crop + rotate |
+| D2 after `flatten` (page) | 232.2 | 194 / 238 / 255 | 0.56 % | 1.17 % | – |
+| D3 before `hyst` (slot) | 232.2 | 196 / 238 / 255 | 0.55 % | 1.16 % | 4193 (1.20 %) |
+| `BITONAL_SLOTFLAT=1`: D1 / D3 | 115.7 / 230.1 | – | 85.4 / 1.1 % | – | 324 322 / 7046 |
+
+So the fill is not light: its luma is ≈ 0.43 (78 % of the rectangle in the 102–127 bin), the text is ≈ 1.0 (5 % in 230–255).
+`flatten` divides by a σ = 30 px blur; the circles are far wider, so the fill becomes ≈ 1.0 and the white text (> 1.0) is
+clipped to 1.0 with it. That is by construction (`min(1.0)` in `flatten`) and no threshold after it can bring it back: the
+CLI threshold on the whole file gives 6830 ink px at 70 % and 33 812 (9.7 %) at 80 %, still no text. The threshold alone on
+the unflattened grey makes the fill ink and leaves the text white: all three circles readable, but the photo nearly all black.
+Flattening the slot after the rotation (SLOTFLAT) changes nothing essential (same σ).
+
+**Blur width** (offline on the unflattened slot, Python, white border outside the slot, not the Rust `gauss` clamp):
+σ 30 / 120 / 300 / 1000 px → slot ink 9.1 / 22.1 / 35.9 / 66.2 %, rectangle 1.2 / 4.8 / 19.0 / 82.1 %. By eye only σ 1000 makes
+all circle text readable; 300 reads parts of it.
+
+**What was built:** `keep_box` also returns its cover signal (the #66 rule: more than `KEEP_EDGE_MAX` big pieces touch a
+cut side; only f5 p1 on f1–f7 and `tests/real`). For such a slot `finish` re-decodes the page, applies the same crop + deskew
+to the unflattened grey, flattens it with `COVER_BLUR_SIGMA` = 1000 px (light falloff only), thresholds, clears bands and runs
+`keep_box` again on that. Text pages never see it. New test `cover_flatten_keeps_fill_around_white_text`. Not tried: a
+local/adaptive threshold other than the blur width (flatten + fixed threshold already is one, window σ); a grey cover page
+(needs a grey/JPEG page writer, section 5.7 issue 1; estimated from the D1 slot at 150 dpi: Flate 1.30 MB, JPEG q65 luma
+177 kB, against 51.6 kB for the whole G4 page now).
+
+**Result** (`BASE_BIN=<main> tests/verify.sh`, raw output in the PR): cargo test 13/13, `tests/synth.sh` all PASS, `tests/real.sh`
+ok, suite edge bands 0 on every file, f5 page size unchanged (620.64×766.32 pt). Only f5 differs from main, and in it only
+p1 (the images of p2–p7 are byte-identical). Every other file is byte-identical, so its size is too. f5: 342 557 → 336 842 B
+(p1's image 57.2 → 51.6 kB). f5 p1: 4193 → 287 149 ink px in the rectangle, page ink 8.6 → 68.9 %. Time: f5 1.35–1.41 →
+3.06–3.15 s wall (3 runs each); pass B for p1 2266 ms against ~850 ms for the other pages (re-decode plus threshold, bands and
+components on a mostly black slot); only a cover slot pays that. Nothing from the #60 list can be lost, since no other page
+changed (f5 p1 has no page number).
+
+`checker` against source and main, f5 p1 (100 dpi):
+- The right circle is readable in all three lines (main: missing). "ANDET UDKAST" has speckle and a white wedge at the circle's
+  edge.
+- The middle circle, the headline circle with its subtitle, and the logo are readable, clean white on black (main: partly,
+  hollow letters).
+- The date line is partly readable, better than main. "Nr. 1" has a blob, and a vertical line crosses "September".
+- The photo is recognisable, but posterised into large black areas (main: the boy blown out to white).
+- Nothing present in main is missing.
+
+**Still open:**
+- The masthead "MUSIKLÆREREN" is unreadable in both main and new. Probable cause is the pre-crop box, which cuts covers by
+  17–45 % (section 5.1); not verified.
+- The cover rule is tuned on one page (26 big pieces against at most 12 elsewhere). A cover below the count keeps the old
+  rendering, and there is no hold-out (#47).
+- Readability is `checker`'s judgement at 100 dpi, not a number.
+- `BITONAL_WHITENED=1` lists both `keep_box` passes for a cover slot.
+- The text/fill colours in the source were not measured (luma only).
