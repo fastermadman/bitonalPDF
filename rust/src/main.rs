@@ -10,6 +10,8 @@
 //   BITONAL_KEEP_D=<n>      (#55, #60) with --crop, each slot keeps the text block and the components near it (keep_box:
 //                           "near" = n letter heights, default 4), is cropped to them and centred / top-aligned with
 //                           the others on one canvas (compose; docs/rust-port.md section 8)
+//   BITONAL_WHITENED=1      (#63) with --crop, keep_box prints one TSV row per whitened component to stderr ("whitened" page slot
+//                           x0 y0 x1 y1 pixels letters outside reason); tests/whitened.py filters it. Off: no change.
 //   BITONAL_OSD=tesseract   orientation by Tesseract OSD (as bash) instead of the own detector (#30); --osd-eval prints its accuracy
 //                           (EVAL_UPRIGHT=1: the input pages are upright, no Tesseract truth; #45)
 // --detect-eval a.pdf [b.pdf ...] prints candidate picture/colour signals per page and tile as TSV (#43, docs/rust-port.md section 4).
@@ -105,6 +107,7 @@ struct Cfg {
     deskew_first: bool,
     ink_gutter: bool,
     keep_d: f64, // BITONAL_KEEP_D: keep_box's distance in median letter heights
+    whitened: bool, // BITONAL_WHITENED=1 (#63): keep_box lists what it whitens on stderr
     timing: bool,
     tess: bool, // BITONAL_OSD=tesseract: the old detector
 }
@@ -143,6 +146,7 @@ fn main() {
         slot_flat: env("BITONAL_SLOTFLAT"),
         deskew_first: env("BITONAL_DESKEW_FIRST"),
         ink_gutter: env("BITONAL_INKGUTTER"),
+        whitened: std::env::var("BITONAL_WHITENED").is_ok_and(|v| v == "1"),
         keep_d: std::env::var("BITONAL_KEEP_D").ok().and_then(|s| s.parse().ok()).unwrap_or(4.0),
         timing: env("BITONAL_TIMING"),
         tess: std::env::var("BITONAL_OSD").as_deref() == Ok("tesseract"),
@@ -407,7 +411,8 @@ fn finish(page: &Page, i: usize, m: &Meta, plan: Plan, (tw, th): (i64, i64), cfg
     let mut angles = vec![];
     let out = boxes
         .iter()
-        .map(|&b| {
+        .enumerate()
+        .map(|(slot, &b)| {
             let s = crop(&src, b);
             // Skew per slot: on the ink of the flattened slot (bash: raw grey < 40 %).
             let angle = if cfg.deskew {
@@ -451,7 +456,7 @@ fn finish(page: &Page, i: usize, m: &Meta, plan: Plan, (tw, th): (i64, i64), cfg
                     let (sx, sy) = (gcx + u * cs - v * sn - 0.5, gcy + u * sn + v * cs - 0.5);
                     (cut[0] && sx < 2.0) || (cut[1] && sy < 2.0) || (cut[2] && sx > s.w as f32 - 3.0) || (cut[3] && sy > s.h as f32 - 3.0)
                 };
-                let [x0, y0, x1, y1] = keep_box(&mut bits, c.w, c.h, a, &near_edge, cfg.keep_d);
+                let [x0, y0, x1, y1] = keep_box(&mut bits, c.w, c.h, a, &near_edge, cfg.keep_d, cfg.whitened.then_some((i + 1, slot + 1)));
                 let (w, h) = (x1 - x0, y1 - y0);
                 let mut packed = vec![0u8; w.div_ceil(8) * h];
                 for y in 0..h {
@@ -481,7 +486,7 @@ fn finish(page: &Page, i: usize, m: &Meta, plan: Plan, (tw, th): (i64, i64), cfg
 /// 2 px of a cut side of the slot (`near_edge`), or thin and longer than KEEP_RULE_FRAC of it, unless they reach the
 /// middle half of the block. Everything not kept is whitened; returns the kept box, padded like content_box.
 // ponytail: distance to the kept box, not to each component: a big picture's box can pull in scraps beside it
-fn keep_box(bits: &mut [bool], w: usize, h: usize, a: [usize; 4], near_edge: &dyn Fn(usize, usize) -> bool, dmul: f64) -> [usize; 4] {
+fn keep_box(bits: &mut [bool], w: usize, h: usize, a: [usize; 4], near_edge: &dyn Fn(usize, usize) -> bool, dmul: f64, log: Option<(usize, usize)>) -> [usize; 4] {
     let (lab, comps) = components(bits, w, h);
     let n = comps.len();
     let mut bb = vec![[usize::MAX, usize::MAX, 0, 0]; n]; // x0 y0 x1 y1, exclusive
@@ -507,6 +512,18 @@ fn keep_box(bits: &mut [bool], w: usize, h: usize, a: [usize; 4], near_edge: &dy
     let l = hs.get(hs.len() / 2).copied().unwrap_or(h / 100).max(1) as f64;
     let d = (dmul * l) as usize;
     let (ex0, ey0, ex1, ey1) = (a[0].saturating_sub(d), a[1].saturating_sub(d), a[2] + d, a[3] + d);
+    let reason = |i: usize| -> Option<&'static str> {
+        let b = &bb[i];
+        let (bw, bh) = (b[2] - b[0], b[3] - b[1]);
+        if comps[i].0 == 0 {
+            return None;
+        }
+        let frame = (comps[i].0 as f64) < KEEP_FRAME_FILL * (bw * bh) as f64 && (bw * bh) as f64 > 100.0 * l * l
+            && !(b[0] >= ex0 && b[1] >= ey0 && b[2] <= ex1 && b[3] <= ey1);
+        let rule = bh as f64 > KEEP_RULE_FRAC * h as f64 && bw * 8 < bh;
+        let big = bw.max(bh) as f64 > 3.0 * l;
+        if frame { Some("frame") } else if meets(b, &core) { Some("not joined") } else if edge[i] && big { Some("edge+big") } else if rule { Some("rule") } else { Some("not joined") }
+    };
     let live: Vec<bool> = (0..n)
         .map(|i| {
             let b = &bb[i];
@@ -572,6 +589,16 @@ fn keep_box(bits: &mut [bool], w: usize, h: usize, a: [usize; 4], near_edge: &dy
             break;
         }
     }
+    }
+    if let Some((page, slot)) = log {
+        // TSV: page slot x0 y0 x1 y1 pixels letters(=longer side / l) outside(1 = not inside the text block) reason
+        for i in (0..n).filter(|&i| !kept[i]) {
+            if let Some(r) = reason(i) {
+                let b = bb[i];
+                let out = !(b[0] >= a[0] && b[1] >= a[1] && b[2] <= a[2] && b[3] <= a[3]);
+                eprintln!("whitened\t{page}\t{slot}\t{}\t{}\t{}\t{}\t{}\t{:.2}\t{}\t{r}", b[0], b[1], b[2], b[3], comps[i].0, (b[2] - b[0]).max(b[3] - b[1]) as f64 / l, out as u8);
+            }
+        }
     }
     for i in 0..w * h {
         if bits[i] && !kept[lab[i] as usize] {
@@ -1655,7 +1682,7 @@ mod tests {
         let (mut bits, w, h, a) = text_page();
         letter(&mut bits, w, 340, 640); // 140 px below the block, in its columns
         letter(&mut bits, w, 340, 786); // on the cut bottom edge
-        let k = keep_box(&mut bits, w, h, a, &|_, y| y >= h - 3, 4.0);
+        let k = keep_box(&mut bits, w, h, a, &|_, y| y >= h - 3, 4.0, None);
         assert!(bits[645 * w + 345] && bits[790 * w + 345]);
         assert!(k[3] >= 800);
     }
@@ -1668,7 +1695,7 @@ mod tests {
             bits[y * w + 2] = true;
             bits[y * w + 3] = true;
         }
-        let k = keep_box(&mut bits, w, h, a, &|x, _| x < 3, 4.0);
+        let k = keep_box(&mut bits, w, h, a, &|x, _| x < 3, 4.0, None);
         assert!(!bits[400 * w + 2] && k[0] > 100);
     }
 
@@ -1677,13 +1704,13 @@ mod tests {
     fn keep_box_head_number_not_dotted_rule() {
         let (mut bits, w, h, a) = text_page();
         letter(&mut bits, w, 20, 100); // on the first line, 180 px out
-        let k = keep_box(&mut bits, w, h, a, &|_, _| false, 4.0);
+        let k = keep_box(&mut bits, w, h, a, &|_, _| false, 4.0, None);
         assert!(bits[105 * w + 25] && k[0] <= 20);
         let (mut bits, w, h, a) = text_page();
         for y in (100..700).step_by(30) {
             letter(&mut bits, w, 20, y); // the same letter, further out than the footer zone reaches, but one of a dotted column
         }
-        keep_box(&mut bits, w, h, a, &|_, _| false, 4.0);
+        keep_box(&mut bits, w, h, a, &|_, _| false, 4.0, None);
         assert!(!bits[105 * w + 25]);
     }
 
