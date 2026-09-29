@@ -1,6 +1,6 @@
 #!/bin/bash
 # #55: run f1..f7 (tests/real/new pdfs dont upload/, alphabetical) with all four flags and print tests/page-metrics.py per file.
-# Usage: tests/slotbox-suite.sh <outdir> [env assignments...]   e.g. tests/slotbox-suite.sh /tmp/new BITONAL_SLOTBOX=1
+# Usage: tests/slotbox-suite.sh <outdir> [env assignments...]   e.g. tests/slotbox-suite.sh /tmp/new
 # Binary: rust/target/release/bitonalpdf (build first). Outputs <outdir>/fN.pdf, .facts, .bands.
 set -u
 R=$(cd "$(dirname "$0")/.." && pwd); O=$1; shift; mkdir -p "$O"; i=0

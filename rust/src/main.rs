@@ -7,9 +7,9 @@
 //   BITONAL_SLOTFLAT=1      flatten each slot after crop/deskew like bash, instead of once on the full page
 //   BITONAL_DESKEW_FIRST=1  estimate the skew on the whole page and straighten it before measuring crop/gutter
 //   BITONAL_INKGUTTER=1     gutter profile from the 60 % ink map instead of the lenient grey level (threshold once)
-//   BITONAL_SLOTBOX=1       (#55) per slot after deskew and band whitening: keep the text block and the components near
-//                           it (keep_box), crop to them, centre / top-align on one canvas, instead of centring the whole
-//                           slot (docs/rust-port.md section 8); BITONAL_KEEP_D=<n> sets "near" in letter heights (4)
+//   BITONAL_KEEP_D=<n>      (#55, #60) with --crop, each slot keeps the text block and the components near it (keep_box:
+//                           "near" = n letter heights, default 4), is cropped to them and centred / top-aligned with
+//                           the others on one canvas (compose; docs/rust-port.md section 8)
 //   BITONAL_OSD=tesseract   orientation by Tesseract OSD (as bash) instead of the own detector (#30); --osd-eval prints its accuracy
 //                           (EVAL_UPRIGHT=1: the input pages are upright, no Tesseract truth; #45)
 // --detect-eval a.pdf [b.pdf ...] prints candidate picture/colour signals per page and tile as TSV (#43, docs/rust-port.md section 4).
@@ -66,8 +66,9 @@ const CROP_EDGE_FRAC: f64 = 0.015;
 const CROP_PAD_FRAC: f64 = 0.012;
 const KEEP_FRAME_FILL: f64 = 0.1; // keep_box: a piece with less ink than this share of its box is a frame/edge candidate
 const KEEP_ZONE_D: f64 = 12.0; // keep_box: sideways reach on the header/footer line, in letter heights
+const KEEP_HEAD_D: f64 = 24.0; // keep_box: sideways reach on the block's top/bottom kept line, in letter heights (f1 p3: 18)
 const KEEP_RULE_FRAC: f64 = 0.25; // keep_box: a thin piece longer than this share of the slot height is a rule (f7 p4's bar is shorter)
-const TIGHT_RIM: f32 = 0.03; // BITONAL_SLOTBOX: white rim around a slot before its box is measured (> CROP_EDGE_FRAC)
+const TIGHT_RIM: f32 = 0.03; // --crop: white rim around a slot before its box is measured (> CROP_EDGE_FRAC)
 const BLUR_SIGMA: f32 = 30.0; // px at the output dpi, like bash's -blur 0x30
 const SKEW_MAX_DEG: f32 = 10.0;
 
@@ -103,7 +104,6 @@ struct Cfg {
     slot_flat: bool,
     deskew_first: bool,
     ink_gutter: bool,
-    slot_box: bool,
     keep_d: f64, // BITONAL_KEEP_D: keep_box's distance in median letter heights
     timing: bool,
     tess: bool, // BITONAL_OSD=tesseract: the old detector
@@ -143,7 +143,6 @@ fn main() {
         slot_flat: env("BITONAL_SLOTFLAT"),
         deskew_first: env("BITONAL_DESKEW_FIRST"),
         ink_gutter: env("BITONAL_INKGUTTER"),
-        slot_box: env("BITONAL_SLOTBOX"),
         keep_d: std::env::var("BITONAL_KEEP_D").ok().and_then(|s| s.parse().ok()).unwrap_or(4.0),
         timing: env("BITONAL_TIMING"),
         tess: std::env::var("BITONAL_OSD").as_deref() == Ok("tesseract"),
@@ -219,7 +218,7 @@ fn main() {
     let slots: Vec<(u32, u32, Vec<u8>, [usize; 2])> =
         par_pages(&data, n, |p, i| finish(p, i, &metas[i], plans[i], (tw, th), &cfg)).into_iter().flatten().collect();
     let pages: Vec<(u32, u32, Vec<u8>)> =
-        if cfg.slot_box && cfg.crop { compose(slots) } else { slots.into_iter().map(|(w, h, g, _)| (w, h, g)).collect() };
+        if cfg.crop { compose(slots) } else { slots.into_iter().map(|(w, h, g, _)| (w, h, g)).collect() };
     let t2 = Instant::now();
     if cfg.timing {
         eprintln!("pass A {} ms, pass B {} ms", (t1 - t0).as_millis(), (t2 - t1).as_millis());
@@ -386,7 +385,7 @@ fn plan(metas: &[Meta], cfg: &Cfg) -> (Vec<Plan>, Vec<usize>) {
 }
 
 /// Pass B: one or two finished slots (w, h, G4) for a page.
-/// BITONAL_SLOTBOX: instead of G4, the slot's ink box packed 1 bit/px plus the text block's anchor in it (centre x, top y).
+/// With --crop: instead of G4, the slot's ink box packed 1 bit/px plus the text block's anchor in it (centre x, top y).
 fn finish(page: &Page, i: usize, m: &Meta, plan: Plan, (tw, th): (i64, i64), cfg: &Cfg) -> Vec<(u32, u32, Vec<u8>, [usize; 2])> {
     let t0 = Instant::now();
     let mut src = load(page, cfg, m.rot);
@@ -403,7 +402,7 @@ fn finish(page: &Page, i: usize, m: &Meta, plan: Plan, (tw, th): (i64, i64), cfg
         Plan::Box(b) => vec![b],
         Plan::Split([x0, y0, x1, y1], gx) => vec![[x0, y0, gx, y1], [gx, y0, x1, y1]],
     };
-    let tight = cfg.slot_box && cfg.crop && !matches!(plan, Plan::Whole);
+    let tight = cfg.crop;
     let extent = tw > 0 && !matches!(plan, Plan::Whole);
     let mut angles = vec![];
     let out = boxes
@@ -473,7 +472,7 @@ fn finish(page: &Page, i: usize, m: &Meta, plan: Plan, (tw, th): (i64, i64), cfg
     out
 }
 
-/// BITONAL_SLOTBOX (#55): which ink of a deskewed slot to keep, as connected components. Seeds: components that
+/// --crop (#55): which ink of a deskewed slot to keep, as connected components. Seeds: components that
 /// meet the text block `a` ([x0,y0,x1,y1)). Then, repeatedly, any component within `dmul` median letter heights of
 /// the kept box joins it (margin labels, a title running past the block, letter by letter), or at any distance when
 /// it is straight above/below it and more than a speck (page numbers, running heads: often > 8 % below the block), or
@@ -536,8 +535,14 @@ fn keep_box(bits: &mut [bool], w: usize, h: usize, a: [usize; 4], near_edge: &dy
     if k[2] == 0 {
         return a; // nothing in the block (blank slot): keep the block's box, whiten nothing
     }
+    // pass 0 grows the kept box; pass 1 adds head-line letters once and does not iterate, or a rule beside a page number
+    // would be pulled in by the enlarged box (f1 p5)
+    for head_pass in [false, true] {
     loop {
         let mut grew = false;
+        // top and bottom of the kept text lines: a dash or speck above the head must not move the head line
+        let kl = (0..n).filter(|&j| kept[j] && (bb[j][3] - bb[j][1]) as f64 >= l / 2.0);
+        let (top, bot) = kl.fold((usize::MAX, 0), |(t, u), j| (t.min(bb[j][1]), u.max(bb[j][3])));
         for i in 0..n {
             let b = bb[i];
             let (gx, gy) = (gap(b[0], b[2], k[0], k[2]), gap(b[1], b[3], k[1], k[3]));
@@ -547,16 +552,26 @@ fn keep_box(bits: &mut [bool], w: usize, h: usize, a: [usize; 4], near_edge: &dy
             // the head (f1 p3) or centred under a one-column last page (flerspaltet p9: 62 px beside, 886 px below).
             let letter = comps[i].0 as f64 >= l * l / 8.0 && ((b[2] - b[0]).max(b[3] - b[1]) as f64) <= 3.0 * l;
             let zone = b[3] <= a[1] || b[1] >= a[3];
+            // the block's top/bottom kept line (the running head): a letter on it may sit KEEP_HEAD_D letters out sideways
+            // (f1 p3 "14"), unless it is one of a dotted rule: >= 3 other narrow pieces in its columns (rule segments too) spread over KEEP_RULE_FRAC of h
+            let headline = head_pass && letter && (b[3] - b[1]) as f64 >= l / 2.0 && gx as f64 <= KEEP_HEAD_D * l && ((b[1] as f64) < top as f64 + 1.5 * l || b[3] as f64 > bot as f64 - 1.5 * l)
+                && {
+                    let st: Vec<usize> = (0..n).filter(|&j| j != i && bb[j][0] < b[2] && b[0] < bb[j][2]
+                        && comps[j].0 as f64 >= l * l / 8.0 && (bb[j][2] - bb[j][0]) as f64 <= 3.0 * l).collect();
+                    let (lo, hi) = st.iter().fold((b[1], b[3]), |(lo, hi), &j| (lo.min(bb[j][1]), hi.max(bb[j][3])));
+                    st.len() < 3 || (hi - lo) as f64 <= KEEP_RULE_FRAC * h as f64
+                };
             if live[i] && !kept[i]
-                && ((gx == 0 && comps[i].0 as f64 >= l * l / 8.0) || (gx <= d && gy <= d) || (zone && letter && gx as f64 <= KEEP_ZONE_D * l))
+                && if head_pass { headline } else { (gx == 0 && comps[i].0 as f64 >= l * l / 8.0) || (gx <= d && gy <= d) || (zone && letter && gx as f64 <= KEEP_ZONE_D * l) }
             {
                 add(i, &mut kept, &mut k);
                 grew = true;
             }
         }
-        if !grew {
+        if !grew || head_pass {
             break;
         }
+    }
     }
     for i in 0..w * h {
         if bits[i] && !kept[lab[i] as usize] {
@@ -567,7 +582,7 @@ fn keep_box(bits: &mut [bool], w: usize, h: usize, a: [usize; 4], near_edge: &dy
     [k[0].saturating_sub(px), k[1].saturating_sub(py), (k[2] + px).min(w), (k[3] + py).min(h)]
 }
 
-/// BITONAL_SLOTBOX (#55): packed 1-bit ink boxes with their text-block anchor -> one canvas; every anchor lands on the
+/// --crop (#55): packed 1-bit ink boxes with their text-block anchor -> one canvas; every anchor lands on the
 /// same centre x and top y, the canvas is just big enough for all of them plus a margin, then G4. Pure bit placement.
 // ponytail: one slot with ink far from its text block (an edge band that was not whitened) widens every page
 fn compose(slots: Vec<(u32, u32, Vec<u8>, [usize; 2])>) -> Vec<(u32, u32, Vec<u8>)> {
@@ -1607,5 +1622,83 @@ mod tests {
         assert!(y0 > 100 && y0 < 200, "{y0}");
         assert!(y1 > 1200, "{y1}");
         assert!(x0 < 150 && x1 > 850);
+    }
+
+    // keep_box (#55, #60) on a synthetic page: 10x14 letters in 13 lines make the text block. Returns the bits and its box.
+    fn text_page() -> (Vec<bool>, usize, usize, [usize; 4]) {
+        let (w, h) = (600usize, 800usize);
+        let mut bits = vec![false; w * h];
+        for line in 0..13 {
+            for k in 0..18 {
+                for y in 0..14 {
+                    for x in 0..10 {
+                        bits[(100 + line * 30 + y) * w + 200 + k * 16 + x] = true;
+                    }
+                }
+            }
+        }
+        let a = content_box(&bits, w, h, false);
+        (bits, w, h, a)
+    }
+
+    fn letter(bits: &mut [bool], w: usize, x: usize, y: usize) {
+        for yy in y..y + 14 {
+            for xx in x..x + 10 {
+                bits[yy * w + xx] = true;
+            }
+        }
+    }
+
+    // A page number far below a pre-cropped block is kept, and so is one on the cut edge.
+    #[test]
+    fn keep_box_keeps_page_numbers() {
+        let (mut bits, w, h, a) = text_page();
+        letter(&mut bits, w, 340, 640); // 140 px below the block, in its columns
+        letter(&mut bits, w, 340, 786); // on the cut bottom edge
+        let k = keep_box(&mut bits, w, h, a, &|_, y| y >= h - 3, 4.0);
+        assert!(bits[645 * w + 345] && bits[790 * w + 345]);
+        assert!(k[3] >= 800);
+    }
+
+    // A thin full-height rule at the edge is dropped, and the box does not stretch to it.
+    #[test]
+    fn keep_box_drops_edge_rule() {
+        let (mut bits, w, h, a) = text_page();
+        for y in 0..h {
+            bits[y * w + 2] = true;
+            bits[y * w + 3] = true;
+        }
+        let k = keep_box(&mut bits, w, h, a, &|x, _| x < 3, 4.0);
+        assert!(!bits[400 * w + 2] && k[0] > 100);
+    }
+
+    // A page number beside the running head is kept (#60) unless a dotted rule stands right there.
+    #[test]
+    fn keep_box_head_number_not_dotted_rule() {
+        let (mut bits, w, h, a) = text_page();
+        letter(&mut bits, w, 20, 100); // on the first line, 180 px out
+        let k = keep_box(&mut bits, w, h, a, &|_, _| false, 4.0);
+        assert!(bits[105 * w + 25] && k[0] <= 20);
+        let (mut bits, w, h, a) = text_page();
+        for y in (100..700).step_by(30) {
+            letter(&mut bits, w, 20, y); // the same letter, further out than the footer zone reaches, but one of a dotted column
+        }
+        keep_box(&mut bits, w, h, a, &|_, _| false, 4.0);
+        assert!(!bits[105 * w + 25]);
+    }
+
+    // After compose, ink that filled two differently wide slots edge to edge has the same margin on both sides.
+    #[test]
+    fn compose_equal_margins() {
+        let slot = |w: usize, h: usize| (w as u32, h as u32, vec![0xFFu8; w.div_ceil(8) * h], [w / 2, 0]);
+        let pages = compose(vec![slot(96, 40), slot(160, 56)]);
+        let pdf = write_pdf(&pages, 150.0);
+        let doc = Pdf::new(Arc::new(pdf)).unwrap();
+        for page in doc.pages().iter() {
+            let (g, _) = page_gray(page, 150.0, true);
+            let (gw, gh) = (g.w as usize, g.h as usize);
+            let cols: Vec<usize> = (0..gw).filter(|&x| (0..gh).any(|y| g.px[y * gw + x] < 128)).collect();
+            assert_eq!(cols[0], gw - 1 - cols[cols.len() - 1]);
+        }
     }
 }
