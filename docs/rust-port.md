@@ -878,9 +878,11 @@ detection, whose upper bound is `--detect-eval` itself (300-dpi render + 11 sign
 page, measured in the audit run under load; 6–7 s wall idle), ≤ +28 % CPU on the Tesseract path; `hasler` alone is one pass over the RGB.
 
 **Encode time, measured (#75):** `jpeg-encoder` 0.7.1, q65, 4:2:0, one A4 page at 150 dpi (1240×1754, synthetic text-like RGB, 344 kB): 14, 13, 13 ms
-(3 runs, release, `cargo test --release -- --ignored --nocapture jpeg_encode_time`) [measured]. That is a tenth of the 0.03–0.15 s ImageMagick
-needed per crop, so the encode is unlikely to be what the "≈ 0.1 s CPU per colour page" above is spent on (the render to RGB was not timed here). A real scan with more
-texture may be slower; not measured on one.
+(3 runs, release, `cargo test --release -- --ignored --nocapture jpeg_encode_time`) [measured]. ImageMagick needed 0.03–0.15 s per crop.
+
+On a real page (f1 = Allan Poulsen, input pages 0 and 5, 2150×1518 px at 150 dpi, 3 runs each, release): `page_rgb` (the render) 71–88 ms
+(first run 84/88, then 71–74), encode **20 ms** every run, 351 583 and 329 211 B [measured]. The synthetic page is the smaller case
+(2.2 vs 3.3 MP): the real page costs 1.5× as much to encode, and the render is 3.5× the encode, so keeping the RGB is the larger part of the ≈ 0.1 s per colour page.
 
 ### 5.7 Recommendation: go with reservations
 **Go** for **page-level mixed output with a page list**: text mode, plus MODE=images pages where the user lists them (`--colour-pages`), and

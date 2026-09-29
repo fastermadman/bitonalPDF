@@ -1642,6 +1642,24 @@ mod tests {
         }
     }
 
+    // Same on a real page: REAL_PDF=<file> REAL_PAGE=<0-based> cargo test --release -- --ignored --nocapture jpeg_encode_time_real
+    // Times the render to RGB (page_rgb) and the encode separately.
+    #[test]
+    #[ignore]
+    fn jpeg_encode_time_real() {
+        let f = std::env::var("REAL_PDF").expect("REAL_PDF");
+        let k: usize = std::env::var("REAL_PAGE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let doc = Pdf::new(Arc::new(std::fs::read(f).unwrap())).unwrap();
+        for run in 1..=3 {
+            let t = Instant::now();
+            let rgb = page_rgb(&doc.pages()[k], 150.0);
+            let render_ms = t.elapsed().as_millis();
+            let t = Instant::now();
+            let n = encode_jpeg(&rgb, 65).len();
+            eprintln!("run {run}: {}x{} render {render_ms} ms, encode {} ms, {n} B", rgb.w, rgb.h, t.elapsed().as_millis());
+        }
+    }
+
     // A slanted, dithered dark band at the slot edge is whitened (#53), no single column of it reaches half the height;
     // a text-like left margin (short stems) and text are kept.
     #[test]
