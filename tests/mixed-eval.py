@@ -8,6 +8,8 @@ Usage: tests/mixed-eval.py det.tsv <folder with X.pdf, X.labels> geom.txt slots.
   text dir / images dir: fN.texttess.pdf / fN.images.pdf (same output page count as the run above)
   --sizes    also render every page at 150 dpi and JPEG (q65 4:2:0, MODE=images' setting) the labelled and the detected
              boxes; renders and JPEGs go to <folder>/work/m3/ (git-ignored), only numbers are printed.
+  --policies colour policies of #74 (docs/rust-port.md section 9): size and region outcome per page-list policy, and the
+             grey JPEG page (images-mode page re-encoded as luma q65); extracted JPEGs go to <folder>/work/m3/grey/.
 fN = the PDFs in alphabetical order. Classes picture/diagram/coloured-text/cover are pooled into `keep` (section 5.1).
 Cuts are chosen recall-first on six files and applied to the seventh (leave-one-file-out); in-sample cuts are also shown.
 """
@@ -15,6 +17,7 @@ import sys, os, re, subprocess, collections, unicodedata
 
 det, folder, geomf, slotf, tdir, idir = sys.argv[1:7]
 SIZES = '--sizes' in sys.argv
+POLICIES = '--policies' in sys.argv
 KEEP = {'picture', 'diagram', 'coloured-text', 'cover'}
 TILE = 320
 names = sorted(f for f in os.listdir(folder) if f.endswith('.pdf'))
@@ -235,6 +238,90 @@ for f in files:
     print(f'| {f} | ' + ' | '.join(f'{b[c] / 1e6:.2f} MB' for c in 'tilpsb') + f' | {b["nl"]} / {b["np"]} / {b["ns"]} / {b["nb"]} / {len(sl)} |')
 print(f'| sum | ' + ' | '.join(f'{tot[c] / 1e6:.2f} MB ({tot[c] / tot["t"]:.2f}x)' for c in 'tilpsb')
       + f' | {tot["nl"]} / {tot["np"]} / {tot["ns"]} / {tot["nb"]} / {tot["n"]} |')
+
+if POLICIES:
+    # Region outcome: kept = every output slot the region touches is a JPEG page, partial = some, else lost (picture,
+    # cover: binarised) or degraded (diagram, coloured text: 1-bit, SSIM 0.79-0.85 in section 5.2). A keep page without
+    # a box (f7 p7, inline colour) counts as one page-sized coloured-text region.
+    def hcut(f):  # page hasler cut, leave-one-file-out: lowest keep page of the other six files (as section 5.1)
+        return min(pages[k][2] for k in pages if k[0] != f and LAB[k[0]][k[1]][0] & KEEP)
+    D2 = {k for k in pages if pages[k][2] >= hcut(k[0])}
+    SHARE = {f: sum(k in D2 for k in pages if k[0] == f) / sum(1 for k in pages if k[0] == f) for f in files}
+    print('\n## Policies (#74): page hasler share per file (input pages flagged by the leave-one-file-out page cut)\n')
+    print(', '.join(f'{f} {SHARE[f]:.2f}' for f in files))
+    work = os.path.join(folder, 'work', 'm3', 'grey')
+    os.makedirs(work, exist_ok=True)
+    def grey_sizes(f):
+        """Images-mode page -> (colour, grey) bytes, both re-encoded q65 from the same page JPEG (so only luma vs RGB differs)."""
+        out = {}
+        pdf = f'{idir}/{f}.images.pdf'
+        n = len(img_sizes(pdf))
+        for o in range(1, n + 1):
+            src = f'{work}/{f}-{o:03d}'
+            if not os.path.exists(src + '-000.jpg'):
+                subprocess.run(['pdfimages', '-j', '-f', str(o), '-l', str(o), pdf, src], check=True)
+            r = []
+            for opts in (['-sampling-factor', '4:2:0'], ['-colorspace', 'Gray']):
+                subprocess.run(['magick', src + '-000.jpg', *opts, '-quality', '65', f'{work}/tmp.jpg'], check=True)
+                r.append(os.path.getsize(f'{work}/tmp.jpg'))
+            out[o] = tuple(r)
+        return out
+    def slot_hit(k, s, boxes):
+        return any(ov(b, s) > 0 for b in boxes)
+    POL = [  # name, decision (file, output page, input page, slot box, share) -> JPEG page?
+        ('D0 text (today)', lambda f, o, k, s: False),
+        ('labels, per output page (reference)', lambda f, o, k, s: slot_hit(k, s, [px(k, r) for r in LAB[f][k[1]][2]])
+            or (bool(LAB[f][k[1]][0] & KEEP) and not LAB[f][k[1]][2])),
+        ('D1 auto, tiles R 0.99', lambda f, o, k, s: slot_hit(k, s, DET[SAFE][k])),
+        ("D1' tiles R 0.8", lambda f, o, k, s: slot_hit(k, s, DET[BAL][k])),
+        ('D2 page hasler', lambda f, o, k, s: k in D2),
+        ('D3 every RGB-source page', lambda f, o, k, s: pages[k][3]),
+        ('D4 doc mode, share >= 0.5 -> all JPEG, else D2', lambda f, o, k, s: SHARE[f] >= 0.5 or k in D2),
+        ('D4 doc mode, share >= 0.8 -> all JPEG, else D2', lambda f, o, k, s: SHARE[f] >= 0.8 or k in D2),
+        ('D5 input page 1 only', lambda f, o, k, s: k[1] == 1),
+        ('D1 + D5', lambda f, o, k, s: slot_hit(k, s, DET[SAFE][k]) or k[1] == 1),
+        ('D2 + D5', lambda f, o, k, s: k in D2 or k[1] == 1),
+    ]
+    SL = {f: slots(f) for f in files}
+    TS = {f: img_sizes(f'{tdir}/{f}.texttess.pdf') for f in files}
+    IS = {f: img_sizes(f'{idir}/{f}.images.pdf') for f in files}
+    GS = {f: grey_sizes(f) for f in files}
+    ttot = sum(sum(TS[f].values()) for f in files)
+    print('\n## Policies (#74): size and region outcome, page level (colour JPEG page = MODE=images page)\n')
+    print('| policy | size | x text | JPEG output pages (of text-only slots) | grey JPEG instead: size, x text | regions kept / partial / lost / degraded | not kept |')
+    print('|---|---:|---:|---:|---:|---:|---|')
+    SETS = {}
+    for name, dec in POL:
+        size = grey = n = nfp = 0
+        C = {}
+        for f in files:
+            for o, (k, s) in SL[f].items():
+                c = C[(f, o)] = dec(f, o, k, s)
+                size += IS[f][o] if c else TS[f][o]
+                grey += IS[f][o] * GS[f][o][1] / GS[f][o][0] if c else TS[f][o]
+                n += c
+                nfp += c and not (slot_hit(k, s, [px(k, r) for r in LAB[f][k[1]][2]]) or bool(LAB[f][k[1]][0] & KEEP))
+        SETS[name] = {k for k, v in C.items() if v}
+        out = collections.Counter(); bad = []
+        for f in files:
+            for k in (k for k in pages if k[0] == f and LAB[f][k[1]][0] & KEEP):
+                regs = LAB[f][k[1]][2] or [('coloured-text', 0, 0, 1, 1)]
+                for r in regs:
+                    hit = [C[(f, o)] for o, (kk, s) in SL[f].items() if kk == k and ov(px(k, r), s) > 0]
+                    v = 'kept' if all(hit) else 'partial' if any(hit) else 'lost' if r[0] in ('picture', 'cover') else 'degraded'
+                    out[v] += 1
+                    if v != 'kept':
+                        bad.append(f'{f} p{k[1]} {r[0]}{"" if LAB[f][k[1]][1] else "?"}{"" if v == "lost" else f" ({v})"}')
+        nts = sum(1 for f in files for o, (k, s) in SL[f].items()
+                  if not (slot_hit(k, s, [px(k, r) for r in LAB[f][k[1]][2]]) or bool(LAB[f][k[1]][0] & KEEP)))
+        print(f'| {name} | {size / 1e6:.2f} MB | {size / ttot:.2f} | {n} ({nfp}/{nts}) | {grey / 1e6:.2f} MB, {grey / ttot:.2f} | '
+              f'{out["kept"]} / {out["partial"]} / {out["lost"]} / {out["degraded"]} | {"; ".join(bad) or "none"} |')
+    print(f'\nD1 and D3 choose the same output pages: {SETS["D1 auto, tiles R 0.99"] == SETS["D3 every RGB-source page"]}')
+    cg = [sum(GS[f][o][i] for o in GS[f]) for f in files for i in (0, 1)]
+    print('\nGrey / colour, same page JPEG re-encoded q65 (MODE=images pages): '
+          + ', '.join(f'{f} {cg[2 * i + 1] / cg[2 * i]:.2f}' for i, f in enumerate(files))
+          + f', all {sum(cg[1::2]) / sum(cg[0::2]):.2f}; re-encoded colour / original {sum(cg[0::2]) / sum(sum(IS[f].values()) for f in files):.2f}')
+    print('(? = uncertain label page. Grey column: every JPEG page scaled by its grey/colour ratio, an estimate from re-encoding.)')
 
 if SIZES:
     work = os.path.join(folder, 'work', 'm3')
