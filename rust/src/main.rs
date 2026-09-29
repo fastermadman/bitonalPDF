@@ -7,9 +7,9 @@
 //   BITONAL_SLOTFLAT=1      flatten each slot after crop/deskew like bash, instead of once on the full page
 //   BITONAL_DESKEW_FIRST=1  estimate the skew on the whole page and straighten it before measuring crop/gutter
 //   BITONAL_INKGUTTER=1     gutter profile from the 60 % ink map instead of the lenient grey level (threshold once)
-//   BITONAL_SLOTBOX=1       (#55) per slot after deskew and band whitening: crop to all remaining ink, then place the text
-//                           block (content_box) centred / top-aligned on one canvas that fits every slot's ink, instead of
-//                           centring the whole slot (docs/rust-port.md section 8)
+//   BITONAL_SLOTBOX=1       (#55) per slot after deskew and band whitening: keep the text block and the components near
+//                           it (keep_box), crop to them, centre / top-align on one canvas, instead of centring the whole
+//                           slot (docs/rust-port.md section 8); BITONAL_KEEP_D=<n> sets "near" in letter heights (4)
 //   BITONAL_OSD=tesseract   orientation by Tesseract OSD (as bash) instead of the own detector (#30); --osd-eval prints its accuracy
 //                           (EVAL_UPRIGHT=1: the input pages are upright, no Tesseract truth; #45)
 // --detect-eval a.pdf [b.pdf ...] prints candidate picture/colour signals per page and tile as TSV (#43, docs/rust-port.md section 4).
@@ -64,6 +64,9 @@ const CROP_NEAR_FRAC: f64 = 0.08;
 const CROP_BAND_FRAC: f64 = 0.10;
 const CROP_EDGE_FRAC: f64 = 0.015;
 const CROP_PAD_FRAC: f64 = 0.012;
+const KEEP_FRAME_FILL: f64 = 0.1; // keep_box: a piece with less ink than this share of its box is a frame/edge candidate
+const KEEP_ZONE_D: f64 = 12.0; // keep_box: sideways reach on the header/footer line, in letter heights
+const KEEP_RULE_FRAC: f64 = 0.25; // keep_box: a thin piece longer than this share of the slot height is a rule (f7 p4's bar is shorter)
 const TIGHT_RIM: f32 = 0.03; // BITONAL_SLOTBOX: white rim around a slot before its box is measured (> CROP_EDGE_FRAC)
 const BLUR_SIGMA: f32 = 30.0; // px at the output dpi, like bash's -blur 0x30
 const SKEW_MAX_DEG: f32 = 10.0;
@@ -101,6 +104,7 @@ struct Cfg {
     deskew_first: bool,
     ink_gutter: bool,
     slot_box: bool,
+    keep_d: f64, // BITONAL_KEEP_D: keep_box's distance in median letter heights
     timing: bool,
     tess: bool, // BITONAL_OSD=tesseract: the old detector
 }
@@ -140,6 +144,7 @@ fn main() {
         deskew_first: env("BITONAL_DESKEW_FIRST"),
         ink_gutter: env("BITONAL_INKGUTTER"),
         slot_box: env("BITONAL_SLOTBOX"),
+        keep_d: std::env::var("BITONAL_KEEP_D").ok().and_then(|s| s.parse().ok()).unwrap_or(4.0),
         timing: env("BITONAL_TIMING"),
         tess: std::env::var("BITONAL_OSD").as_deref() == Ok("tesseract"),
     };
@@ -431,20 +436,23 @@ fn finish(page: &Page, i: usize, m: &Meta, plan: Plan, (tw, th): (i64, i64), cfg
             let mut bits = hyst(&c, cfg.thresh);
             clear_edge_bands(&mut bits, c.w, c.h);
             if tight {
-                // Position from the text block (no band rule: the bands are whitened already, and at the pre-crop's
-                // edge it cut headings and first lines), but crop only to all remaining ink: content_box as a crop
-                // dropped page numbers, margin labels and long lines (section 8).
-                let [ax0, ay0, ax1, ay1] = content_box(&bits, c.w, c.h, false);
-                let (mut x0, mut y0, mut x1, mut y1) = (c.w, c.h, 0, 0);
-                for y in 0..c.h {
-                    for x in 0..c.w {
-                        if bits[y * c.w + x] {
-                            (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x + 1), y1.max(y + 1));
-                        }
-                    }
-                }
-                // the box always holds the text block (padded, maybe past the last ink), so the anchor is inside it
-                let (x0, y0, x1, y1) = (x0.min(ax0), y0.min(ay0), x1.max(ax1), y1.max(ay1));
+                // What to keep, per component (section 8): the text block, and whatever lies near it; not what
+                // touches the slot's border or is a thin tall rule, unless it reaches the block's core (a full-bleed
+                // picture). Kept ink is cropped, centred and top-aligned by compose.
+                let a = content_box(&bits, c.w, c.h, false);
+                let (sn, cs) = angle.to_radians().sin_cos();
+                let (ox, oy) = ((c.w as i64 - s.w as i64) / 2, (c.h as i64 - s.h as i64) / 2);
+                let (gcx, gcy) = (s.w as f32 / 2.0, s.h as f32 / 2.0);
+                let (ccx, ccy) = (ox as f32 + gcx, oy as f32 + gcy);
+                // same mapping as rotate(): output pixel -> source slot pixel, then "within 2 px of a side that is a cut"
+                // (a side where the pre-crop box reached the page edge is not one: content may run off the page, f5 p1)
+                let cut = [b[0] > 0, b[1] > 0, b[2] < w, b[3] < h];
+                let near_edge = |x: usize, y: usize| {
+                    let (u, v) = (x as f32 + 0.5 - ccx, y as f32 + 0.5 - ccy);
+                    let (sx, sy) = (gcx + u * cs - v * sn - 0.5, gcy + u * sn + v * cs - 0.5);
+                    (cut[0] && sx < 2.0) || (cut[1] && sy < 2.0) || (cut[2] && sx > s.w as f32 - 3.0) || (cut[3] && sy > s.h as f32 - 3.0)
+                };
+                let [x0, y0, x1, y1] = keep_box(&mut bits, c.w, c.h, a, &near_edge, cfg.keep_d);
                 let (w, h) = (x1 - x0, y1 - y0);
                 let mut packed = vec![0u8; w.div_ceil(8) * h];
                 for y in 0..h {
@@ -454,7 +462,7 @@ fn finish(page: &Page, i: usize, m: &Meta, plan: Plan, (tw, th): (i64, i64), cfg
                         }
                     }
                 }
-                return (w as u32, h as u32, packed, [((ax0 + ax1) / 2).saturating_sub(x0), ay0 - y0]);
+                return (w as u32, h as u32, packed, [w / 2, 0]);
             }
             (c.w as u32, c.h as u32, encode_g4(&bits, c.w as u32), [0, 0])
         })
@@ -463,6 +471,100 @@ fn finish(page: &Page, i: usize, m: &Meta, plan: Plan, (tw, th): (i64, i64), cfg
         eprintln!("B page {}: get {} ms, rest {} ms, deskew {:?}", i + 1, (t1 - t0).as_millis(), t1.elapsed().as_millis(), angles);
     }
     out
+}
+
+/// BITONAL_SLOTBOX (#55): which ink of a deskewed slot to keep, as connected components. Seeds: components that
+/// meet the text block `a` ([x0,y0,x1,y1)). Then, repeatedly, any component within `dmul` median letter heights of
+/// the kept box joins it (margin labels, a title running past the block, letter by letter), or at any distance when
+/// it is straight above/below it and more than a speck (page numbers, running heads: often > 8 % below the block), or
+/// when it is a letter above/below the text block within KEEP_ZONE_D letters sideways (a page number beside the head).
+/// Never kept: big sparse pieces reaching out of the block (book edges, frames); pieces bigger than 3 letters within
+/// 2 px of a cut side of the slot (`near_edge`), or thin and longer than KEEP_RULE_FRAC of it, unless they reach the
+/// middle half of the block. Everything not kept is whitened; returns the kept box, padded like content_box.
+// ponytail: distance to the kept box, not to each component: a big picture's box can pull in scraps beside it
+fn keep_box(bits: &mut [bool], w: usize, h: usize, a: [usize; 4], near_edge: &dyn Fn(usize, usize) -> bool, dmul: f64) -> [usize; 4] {
+    let (lab, comps) = components(bits, w, h);
+    let n = comps.len();
+    let mut bb = vec![[usize::MAX, usize::MAX, 0, 0]; n]; // x0 y0 x1 y1, exclusive
+    let mut edge = vec![false; n];
+    for y in 0..h {
+        for x in 0..w {
+            if bits[y * w + x] {
+                let l = lab[y * w + x] as usize;
+                let b = &mut bb[l];
+                *b = [b[0].min(x), b[1].min(y), b[2].max(x + 1), b[3].max(y + 1)];
+                if !edge[l] && near_edge(x, y) {
+                    edge[l] = true;
+                }
+            }
+        }
+    }
+    let gap = |a0: usize, a1: usize, b0: usize, b1: usize| if a1 <= b0 { b0 - a1 } else if b1 <= a0 { a0 - b1 } else { 0 };
+    let meets = |b: &[usize; 4], r: &[usize; 4]| b[0] < r[2] && r[0] < b[2] && b[1] < r[3] && r[1] < b[3];
+    let (qw, qh) = ((a[2] - a[0]) / 4, (a[3] - a[1]) / 4);
+    let core = [a[0] + qw, a[1] + qh, a[2] - qw, a[3] - qh];
+    let mut hs: Vec<usize> = (0..n).filter(|&i| comps[i].0 >= 20 && meets(&bb[i], &a)).map(|i| bb[i][3] - bb[i][1]).collect();
+    hs.sort_unstable();
+    let l = hs.get(hs.len() / 2).copied().unwrap_or(h / 100).max(1) as f64;
+    let d = (dmul * l) as usize;
+    let (ex0, ey0, ex1, ey1) = (a[0].saturating_sub(d), a[1].saturating_sub(d), a[2] + d, a[3] + d);
+    let live: Vec<bool> = (0..n)
+        .map(|i| {
+            let b = &bb[i];
+            let (bw, bh) = (b[2] - b[0], b[3] - b[1]);
+            // a big, sparse piece reaching out of the block is a book edge or frame (f7 p3's L), a table stays inside
+            let frame = (comps[i].0 as f64) < KEEP_FRAME_FILL * (bw * bh) as f64 && (bw * bh) as f64 > 100.0 * l * l
+                && !(b[0] >= ex0 && b[1] >= ey0 && b[2] <= ex1 && b[3] <= ey1);
+            let rule = bh as f64 > KEEP_RULE_FRAC * h as f64 && bw * 8 < bh;
+            // at a cut side only big pieces are junk: a page number can sit right on the pre-crop's edge (f1 p3, flerspaltet p9)
+            let big = bw.max(bh) as f64 > 3.0 * l;
+            comps[i].0 > 0 && !frame && (meets(b, &core) || !((edge[i] && big) || rule))
+        })
+        .collect();
+    let mut kept = vec![false; n];
+    let mut k = [usize::MAX, usize::MAX, 0, 0];
+    let add = |i: usize, kept: &mut Vec<bool>, k: &mut [usize; 4]| {
+        kept[i] = true;
+        let b = &bb[i];
+        *k = [k[0].min(b[0]), k[1].min(b[1]), k[2].max(b[2]), k[3].max(b[3])];
+    };
+    for i in 0..n {
+        if live[i] && meets(&bb[i], &a) {
+            add(i, &mut kept, &mut k);
+        }
+    }
+    if k[2] == 0 {
+        return a; // nothing in the block (blank slot): keep the block's box, whiten nothing
+    }
+    loop {
+        let mut grew = false;
+        for i in 0..n {
+            let b = bb[i];
+            let (gx, gy) = (gap(b[0], b[2], k[0], k[2]), gap(b[1], b[3], k[1], k[3]));
+            // above/below the kept box and within its columns (page number, running head, footnote): any distance
+            // if it is more than a speck; beside it (where rules and edges are): only near. In the header/footer
+            // zone (above or below the text block) a letter may also sit further out sideways: a page number beside
+            // the head (f1 p3) or centred under a one-column last page (flerspaltet p9: 62 px beside, 886 px below).
+            let letter = comps[i].0 as f64 >= l * l / 8.0 && ((b[2] - b[0]).max(b[3] - b[1]) as f64) <= 3.0 * l;
+            let zone = b[3] <= a[1] || b[1] >= a[3];
+            if live[i] && !kept[i]
+                && ((gx == 0 && comps[i].0 as f64 >= l * l / 8.0) || (gx <= d && gy <= d) || (zone && letter && gx as f64 <= KEEP_ZONE_D * l))
+            {
+                add(i, &mut kept, &mut k);
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    for i in 0..w * h {
+        if bits[i] && !kept[lab[i] as usize] {
+            bits[i] = false;
+        }
+    }
+    let (px, py) = ((CROP_PAD_FRAC * w as f64) as usize, (CROP_PAD_FRAC * h as f64) as usize);
+    [k[0].saturating_sub(px), k[1].saturating_sub(py), (k[2] + px).min(w), (k[3] + py).min(h)]
 }
 
 /// BITONAL_SLOTBOX (#55): packed 1-bit ink boxes with their text-block anchor -> one canvas; every anchor lands on the
