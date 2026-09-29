@@ -877,6 +877,11 @@ RGB of the page (Probe converts to luma today) and one JPEG encode of a 150-dpi 
 detection, whose upper bound is `--detect-eval` itself (300-dpi render + 11 signals + components): 44 s CPU for 77 pages (0.57 s per input
 page, measured in the audit run under load; 6–7 s wall idle), ≤ +28 % CPU on the Tesseract path; `hasler` alone is one pass over the RGB.
 
+**Encode time, measured (#75):** `jpeg-encoder` 0.7.1, q65, 4:2:0, one A4 page at 150 dpi (1240×1754, synthetic text-like RGB, 344 kB): 14, 13, 13 ms
+(3 runs, release, `cargo test --release -- --ignored --nocapture jpeg_encode_time`) [measured]. That is a tenth of the 0.03–0.15 s ImageMagick
+needed per crop, so the encode is unlikely to be what the "≈ 0.1 s CPU per colour page" above is spent on (the render to RGB was not timed here). A real scan with more
+texture may be slower; not measured on one.
+
 ### 5.7 Recommendation: go with reservations
 **Go** for **page-level mixed output with a page list**: text mode, plus MODE=images pages where the user lists them (`--colour-pages`), and
 `auto` as a printed suggestion. It halves MODE=images on this material (1.83× vs 3.46× text) with no new PDF construct and one new crate.

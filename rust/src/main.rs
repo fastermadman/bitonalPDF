@@ -689,6 +689,27 @@ fn page_gray(page: &Page, dpi: f32, smooth: bool) -> (Gray, &'static str) {
     (Gray { w, h, px }, "render")
 }
 
+/// An 8-bit RGB raster, 3 bytes per pixel.
+// ponytail: unused until B4e (#76) picks the colour pages. Always rendered, no Probe shortcut: a source JPEG would be re-encoded anyway.
+#[allow(dead_code)]
+struct Rgb {
+    w: u32,
+    h: u32,
+    px: Vec<u8>,
+}
+
+/// The page rendered as RGB at `dpi`, same pixel size as `page_gray`. On demand: the text path never calls it.
+#[allow(dead_code)]
+fn page_rgb(page: &Page, dpi: f32) -> Rgb {
+    let (pw, ph) = page.render_dimensions();
+    let s = dpi / 72.0;
+    let (w, h) = ((pw * s).ceil() as u32, (ph * s).ceil() as u32);
+    let rs = RenderSettings { x_scale: s, y_scale: s, width: Some(w as u16), height: Some(h as u16), bg_color: WHITE };
+    let pix = render(page, &RenderCache::new(), &InterpreterSettings::default(), &rs);
+    // Opaque white background, so premultiplied == straight RGB.
+    Rgb { w, h, px: pix.data().iter().flat_map(|p| [p.r, p.g, p.b]).collect() }
+}
+
 /// Device that only checks whether the page is exactly one unrotated raster image covering the
 /// page within 1 % of the target size, and decodes it if so.
 struct Probe {
@@ -1475,26 +1496,68 @@ fn encode_g4(bits: &[bool], w: u32) -> Vec<u8> {
     enc.finish().unwrap().finish()
 }
 
+/// A finished output page. G4: 1-bit, page size in pt = px*72/dpi. Jpeg: the MediaBox is given (`pt`), so a 150-dpi
+/// colour page can sit on the 300-dpi text canvas' page size.
+#[allow(dead_code)] // Jpeg is unused until B4e (#76)
+enum Slot {
+    G4(u32, u32, Vec<u8>),
+    Jpeg { w: u32, h: u32, data: Vec<u8>, pt: (f32, f32) },
+}
+
+/// RGB -> baseline JPEG, 4:2:0, quality `q` (the encoder's default tables are the IJG ones).
+#[allow(dead_code)]
+fn encode_jpeg(g: &Rgb, q: u8) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut enc = jpeg_encoder::Encoder::new(&mut out, q);
+    enc.set_sampling_factor(jpeg_encoder::SamplingFactor::F_2_2);
+    enc.encode(&g.px, g.w as u16, g.h as u16, jpeg_encoder::ColorType::Rgb).unwrap();
+    out
+}
+
+/// A colour page (q65) for a finished RGB slot, on a page of `pt` points.
+// #76: crop, split and deskew are done on bits in Pass B today; the RGB slot must have them applied before it gets here.
+#[allow(dead_code)]
+fn jpeg_slot(g: &Rgb, pt: (f32, f32)) -> Slot {
+    Slot::Jpeg { w: g.w, h: g.h, data: encode_jpeg(g, 65), pt }
+}
+
 fn write_pdf(pages: &[(u32, u32, Vec<u8>)], dpi: f32) -> Vec<u8> {
+    let slots: Vec<Slot> = pages.iter().map(|(w, h, g4)| Slot::G4(*w, *h, g4.clone())).collect();
+    write_slots(&slots, dpi)
+}
+
+fn write_slots(pages: &[Slot], dpi: f32) -> Vec<u8> {
     use pdf_writer::{Content, Filter, Name, Pdf, Rect, Ref};
     let mut pdf = Pdf::new();
     let (catalog, tree) = (Ref::new(1), Ref::new(2));
     let ids = |k: usize| (Ref::new(3 + 3 * k as i32), Ref::new(4 + 3 * k as i32), Ref::new(5 + 3 * k as i32));
     pdf.catalog(catalog).pages(tree);
     pdf.pages(tree).kids((0..pages.len()).map(|k| ids(k).0)).count(pages.len() as i32);
-    for (k, (w, h, g4)) in pages.iter().enumerate() {
+    for (k, slot) in pages.iter().enumerate() {
         let (page_id, img_id, content_id) = ids(k);
-        let (pw, ph) = (*w as f32 * 72.0 / dpi, *h as f32 * 72.0 / dpi);
+        let (pw, ph) = match slot {
+            Slot::G4(w, h, _) => (*w as f32 * 72.0 / dpi, *h as f32 * 72.0 / dpi),
+            Slot::Jpeg { pt, .. } => *pt,
+        };
         let mut page = pdf.page(page_id);
         page.parent(tree).media_box(Rect::new(0.0, 0.0, pw, ph)).contents(content_id);
         page.resources().x_objects().pair(Name(b"Im0"), img_id);
         drop(page);
-        let mut img = pdf.image_xobject(img_id, g4);
-        img.filter(Filter::CcittFaxDecode);
-        img.width(*w as i32).height(*h as i32).bits_per_component(1);
-        img.color_space().device_gray();
-        img.decode_parms().pair(Name(b"K"), -1).pair(Name(b"Columns"), *w as i32).pair(Name(b"Rows"), *h as i32);
-        drop(img);
+        match slot {
+            Slot::G4(w, h, g4) => {
+                let mut img = pdf.image_xobject(img_id, g4);
+                img.filter(Filter::CcittFaxDecode);
+                img.width(*w as i32).height(*h as i32).bits_per_component(1);
+                img.color_space().device_gray();
+                img.decode_parms().pair(Name(b"K"), -1).pair(Name(b"Columns"), *w as i32).pair(Name(b"Rows"), *h as i32);
+            }
+            Slot::Jpeg { w, h, data, .. } => {
+                let mut img = pdf.image_xobject(img_id, data);
+                img.filter(Filter::DctDecode);
+                img.width(*w as i32).height(*h as i32).bits_per_component(8);
+                img.color_space().device_rgb();
+            }
+        }
         let mut c = Content::new();
         c.save_state().transform([pw, 0.0, 0.0, ph, 0.0, 0.0]).x_object(Name(b"Im0")).restore_state();
         pdf.stream(content_id, &c.finish());
@@ -1520,6 +1583,63 @@ mod tests {
         let (g, src) = page_gray(page, dpi, true);
         assert_eq!((src, g.w, g.h), ("image", w, h));
         assert!(g.px.iter().zip(&bits).all(|(&p, &b)| (p < 128) == b));
+    }
+
+    // One PDF, G4 + JPEG + G4 pages, one page size: hayro decodes all three, G4 stays exact, the JPEG page is the source
+    // within a loose PSNR (proves decoding, colour order and placement, not codec quality).
+    #[test]
+    fn mixed_pdf_roundtrip() {
+        let (w, h, dpi) = (400u32, 300u32, 300.0f32);
+        let bits: Vec<bool> = (0..w * h).map(|i| (i % w) * (i / w) % 7 == 0 || (i % w + 2 * (i / w)) % 13 < 3).collect();
+        let (jw, jh) = (w / 2, h / 2); // 150 dpi on the 300-dpi canvas' page size
+        let px: Vec<u8> = (0..jw * jh)
+            .flat_map(|i| {
+                let (x, y) = (i % jw, i / jw);
+                [(x * 255 / jw) as u8, (y * 255 / jh) as u8, if x < jw / 2 { 40 } else { 220 }]
+            })
+            .collect();
+        let rgb = Rgb { w: jw, h: jh, px };
+        let pt = (w as f32 * 72.0 / dpi, h as f32 * 72.0 / dpi);
+        let g4 = || Slot::G4(w, h, encode_g4(&bits, w));
+        let pdf = write_slots(&[g4(), jpeg_slot(&rgb, pt), g4()], dpi);
+        if let Some(f) = std::env::var_os("MIXED_OUT") {
+            std::fs::write(f, &pdf).unwrap(); // for pdfimages -list / a visual check
+        }
+        let doc = Pdf::new(Arc::new(pdf)).unwrap();
+        let pages = doc.pages();
+        assert_eq!(pages.len(), 3);
+        for p in pages.iter() {
+            let (pw, ph) = p.render_dimensions();
+            assert!((pw - pt.0).abs() < 0.01 && (ph - pt.1).abs() < 0.01);
+        }
+        let (g, src) = page_gray(&pages[0], dpi, true);
+        assert_eq!(src, "image");
+        assert!(g.px.iter().zip(&bits).all(|(&p, &b)| (p < 128) == b));
+        let out = page_rgb(&pages[1], 150.0);
+        assert_eq!((out.w, out.h), (jw, jh));
+        let mse = out.px.iter().zip(&rgb.px).map(|(&a, &b)| (a as f64 - b as f64).powi(2)).sum::<f64>() / rgb.px.len() as f64;
+        let psnr = 10.0 * (255.0f64 * 255.0 / mse.max(1e-9)).log10();
+        assert!(psnr >= 30.0, "psnr {psnr}");
+    }
+
+    // #75: encode time of one 150-dpi A4 page (1240x1754), 3 runs. cargo test --release -- --ignored --nocapture jpeg_encode_time
+    #[test]
+    #[ignore]
+    fn jpeg_encode_time() {
+        let (w, h) = (1240u32, 1754u32);
+        let px: Vec<u8> = (0..w * h)
+            .flat_map(|i| {
+                let (x, y) = (i % w, i / w);
+                let t = if (x / 9 + y / 14) % 5 == 0 { 30 } else { 235 }; // text-like edges on a tint
+                [t, (x * 255 / w) as u8 / 2 + t / 2, (y * 255 / h) as u8 / 2 + t / 2]
+            })
+            .collect();
+        let rgb = Rgb { w, h, px };
+        for run in 1..=3 {
+            let t = Instant::now();
+            let n = encode_jpeg(&rgb, 65).len();
+            eprintln!("run {run}: {} ms, {n} B", t.elapsed().as_millis());
+        }
     }
 
     // A slanted, dithered dark band at the slot edge is whitened (#53), no single column of it reaches half the height;
