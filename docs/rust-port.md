@@ -1336,6 +1336,7 @@ grey source page stays 1-bit (the list fixes it). Unverifiable here: seven scans
 - **B4d (#75):** unchanged, no luma page needed (M2).
 - **B4e (#76):** add `none`, and the default list comes from the policy (D3), printed like the gutter warning; the crop
   decision for listed pages is the top priority there (covers lose 27–45 %).
-- **New:** default policy D3 (+ printed list), after #75/#76; re-measure D1/D2/D3 on the #47 sources before release.
+- **B4f (#78):** default policy D3 (+ printed list), after #75/#76; re-measure D1/D2/D3 on the #47 sources before release.
+- **B2j (#79):** the per-component blur-width choice of 9.3 (text mode, covers).
 - §5.7 conditional issues 3 (`auto` detector) and 4 (coloured text as G4 + colour) stay conditional; issue 4 now also needs
   the flat-vs-continuous signal of 9.2 on non-photographed sources.
