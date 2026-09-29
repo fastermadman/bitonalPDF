@@ -11,7 +11,7 @@
 //                           "near" = n letter heights, default 4), is cropped to them and centred / top-aligned with
 //                           the others on one canvas (compose; docs/rust-port.md section 8)
 //   BITONAL_WHITENED=1      (#63) with --crop, keep_box prints one TSV row per whitened component to stderr ("whitened" page slot
-//                           x0 y0 x1 y1 pixels letters outside reason); tests/whitened.py filters it. Off: no change.
+//                           x0 y0 x1 y1 pixels letters outside reason slot_h); tests/whitened.py filters it. Off: no change.
 //   BITONAL_OSD=tesseract   orientation by Tesseract OSD (as bash) instead of the own detector (#30); --osd-eval prints its accuracy
 //                           (EVAL_UPRIGHT=1: the input pages are upright, no Tesseract truth; #45)
 // --detect-eval a.pdf [b.pdf ...] prints candidate picture/colour signals per page and tile as TSV (#43, docs/rust-port.md section 4).
@@ -596,7 +596,7 @@ fn keep_box(bits: &mut [bool], w: usize, h: usize, a: [usize; 4], near_edge: &dy
             if let Some(r) = reason(i) {
                 let b = bb[i];
                 let out = !(b[0] >= a[0] && b[1] >= a[1] && b[2] <= a[2] && b[3] <= a[3]);
-                eprintln!("whitened\t{page}\t{slot}\t{}\t{}\t{}\t{}\t{}\t{:.2}\t{}\t{r}", b[0], b[1], b[2], b[3], comps[i].0, (b[2] - b[0]).max(b[3] - b[1]) as f64 / l, out as u8);
+                eprintln!("whitened\t{page}\t{slot}\t{}\t{}\t{}\t{}\t{}\t{:.2}\t{}\t{r}\t{h}", b[0], b[1], b[2], b[3], comps[i].0, (b[2] - b[0]).max(b[3] - b[1]) as f64 / l, out as u8);
             }
         }
     }
