@@ -73,6 +73,7 @@ const KEEP_EDGE_MAX: usize = 16; // keep_box: more big pieces than this touching
 const KEEP_RULE_FRAC: f64 = 0.25; // keep_box: a thin piece longer than this share of the slot height is a rule (f7 p4's bar is shorter)
 const TIGHT_RIM: f32 = 0.03; // --crop: white rim around a slot before its box is measured (> CROP_EDGE_FRAC)
 const BLUR_SIGMA: f32 = 30.0; // px at the output dpi, like bash's -blur 0x30
+const COVER_BLUR_SIGMA: f32 = 1000.0; // px, a cover slot's flatten (#71): wider than f5 p1's circles, so fills stay grey
 const SKEW_MAX_DEG: f32 = 10.0;
 
 struct Gray {
@@ -457,7 +458,22 @@ fn finish(page: &Page, i: usize, m: &Meta, plan: Plan, (tw, th): (i64, i64), cfg
                     let (sx, sy) = (gcx + u * cs - v * sn - 0.5, gcy + u * sn + v * cs - 0.5);
                     (cut[0] && sx < 2.0) || (cut[1] && sy < 2.0) || (cut[2] && sx > s.w as f32 - 3.0) || (cut[3] && sy > s.h as f32 - 3.0)
                 };
-                let [x0, y0, x1, y1] = keep_box(&mut bits, c.w, c.h, a, &near_edge, cfg.keep_d, cfg.whitened.then_some((i + 1, slot + 1)));
+                let log = cfg.whitened.then_some((i + 1, slot + 1));
+                let ([mut x0, mut y0, mut x1, mut y1], cover) = keep_box(&mut bits, c.w, c.h, a, &near_edge, cfg.keep_d, log);
+                if cover {
+                    // A cover (#71): the flatten turns a fill wider than BLUR_SIGMA white, and light text on it with it (f5 p1's
+                    // circles). Threshold the unflattened slot again, flattened only against light falloff, and keep from that.
+                    // ponytail: re-decodes the page for the (rare) cover slot instead of holding an unflattened copy of every page
+                    let mut r = load(page, cfg, m.rot);
+                    if m.angle != 0.0 {
+                        r = rotate(&r, m.angle, r.w, r.h, 1.0);
+                    }
+                    let rc = flatten(&rotate(&crop(&r, b), angle, cw, ch, 1.0), COVER_BLUR_SIGMA);
+                    bits = hyst(&rc, cfg.thresh);
+                    clear_edge_bands(&mut bits, rc.w, rc.h);
+                    let a = content_box(&bits, rc.w, rc.h, false);
+                    [x0, y0, x1, y1] = keep_box(&mut bits, rc.w, rc.h, a, &near_edge, cfg.keep_d, log).0;
+                }
                 let (w, h) = (x1 - x0, y1 - y0);
                 let mut packed = vec![0u8; w.div_ceil(8) * h];
                 for y in 0..h {
@@ -487,9 +503,9 @@ fn finish(page: &Page, i: usize, m: &Meta, plan: Plan, (tw, th): (i64, i64), cfg
 /// 2 px of a cut side of the slot (`near_edge`), or thin and longer than KEEP_RULE_FRAC of it, unless they reach the
 /// middle half of the block, or unless more than KEEP_EDGE_MAX big pieces touch a cut side (a cover: the edge rule is off,
 /// #66; the threshold is a rule of thumb measured on f1-f7).
-/// Everything not kept is whitened; returns the kept box, padded like content_box.
+/// Everything not kept is whitened; returns the kept box, padded like content_box, and whether the slot is a cover (edge rule off).
 // ponytail: distance to the kept box, not to each component: a big picture's box can pull in scraps beside it
-fn keep_box(bits: &mut [bool], w: usize, h: usize, a: [usize; 4], near_edge: &dyn Fn(usize, usize) -> bool, dmul: f64, log: Option<(usize, usize)>) -> [usize; 4] {
+fn keep_box(bits: &mut [bool], w: usize, h: usize, a: [usize; 4], near_edge: &dyn Fn(usize, usize) -> bool, dmul: f64, log: Option<(usize, usize)>) -> ([usize; 4], bool) {
     let (lab, comps) = components(bits, w, h);
     let n = comps.len();
     let mut bb = vec![[usize::MAX, usize::MAX, 0, 0]; n]; // x0 y0 x1 y1, exclusive
@@ -557,7 +573,7 @@ fn keep_box(bits: &mut [bool], w: usize, h: usize, a: [usize; 4], near_edge: &dy
         }
     }
     if k[2] == 0 {
-        return a; // nothing in the block (blank slot): keep the block's box, whiten nothing
+        return (a, runs_off); // nothing in the block (blank slot): keep the block's box, whiten nothing
     }
     // pass 0 grows the kept box; pass 1 adds head-line letters once and does not iterate, or a rule beside a page number
     // would be pulled in by the enlarged box (f1 p5)
@@ -613,7 +629,7 @@ fn keep_box(bits: &mut [bool], w: usize, h: usize, a: [usize; 4], near_edge: &dy
         }
     }
     let (px, py) = ((CROP_PAD_FRAC * w as f64) as usize, (CROP_PAD_FRAC * h as f64) as usize);
-    [k[0].saturating_sub(px), k[1].saturating_sub(py), (k[2] + px).min(w), (k[3] + py).min(h)]
+    ([k[0].saturating_sub(px), k[1].saturating_sub(py), (k[2] + px).min(w), (k[3] + py).min(h)], runs_off)
 }
 
 /// --crop (#55): packed 1-bit ink boxes with their text-block anchor -> one canvas; every anchor lands on the
@@ -1689,7 +1705,7 @@ mod tests {
         let (mut bits, w, h, a) = text_page();
         letter(&mut bits, w, 340, 640); // 140 px below the block, in its columns
         letter(&mut bits, w, 340, 786); // on the cut bottom edge
-        let k = keep_box(&mut bits, w, h, a, &|_, y| y >= h - 3, 4.0, None);
+        let (k, _) = keep_box(&mut bits, w, h, a, &|_, y| y >= h - 3, 4.0, None);
         assert!(bits[645 * w + 345] && bits[790 * w + 345]);
         assert!(k[3] >= 800);
     }
@@ -1702,8 +1718,26 @@ mod tests {
             bits[y * w + 2] = true;
             bits[y * w + 3] = true;
         }
-        let k = keep_box(&mut bits, w, h, a, &|x, _| x < 3, 4.0, None);
+        let (k, _) = keep_box(&mut bits, w, h, a, &|x, _| x < 3, 4.0, None);
         assert!(!bits[400 * w + 2] && k[0] > 100);
+    }
+
+    // #71: white text on a grey fill wider than BLUR_SIGMA (f5 p1's circles). The normal flatten whitens fill and text alike;
+    // the cover flatten keeps the fill as ink and the text white.
+    #[test]
+    fn cover_flatten_keeps_fill_around_white_text() {
+        let (w, h) = (1000usize, 1000usize);
+        let px = (0..w * h).map(|i| {
+            let (x, y) = (i % w, i / w);
+            let fill = (300..700).contains(&x) && (300..700).contains(&y);
+            let text = (480..520).contains(&x) && (480..520).contains(&y);
+            if fill && !text { 0.43 } else { 1.0 }
+        });
+        let g = Img { w, h, px: px.collect() };
+        let normal = hyst(&flatten(&g, BLUR_SIGMA), 60.0);
+        assert!(!normal[400 * w + 400]);
+        let cover = hyst(&flatten(&g, COVER_BLUR_SIGMA), 60.0);
+        assert!(cover[400 * w + 400] && !cover[500 * w + 500]);
     }
 
     // A page number beside the running head is kept (#60) unless a dotted rule stands right there.
@@ -1711,7 +1745,7 @@ mod tests {
     fn keep_box_head_number_not_dotted_rule() {
         let (mut bits, w, h, a) = text_page();
         letter(&mut bits, w, 20, 100); // on the first line, 180 px out
-        let k = keep_box(&mut bits, w, h, a, &|_, _| false, 4.0, None);
+        let (k, _) = keep_box(&mut bits, w, h, a, &|_, _| false, 4.0, None);
         assert!(bits[105 * w + 25] && k[0] <= 20);
         let (mut bits, w, h, a) = text_page();
         for y in (100..700).step_by(30) {
