@@ -7,6 +7,9 @@
 //   BITONAL_SLOTFLAT=1      flatten each slot after crop/deskew like bash, instead of once on the full page
 //   BITONAL_DESKEW_FIRST=1  estimate the skew on the whole page and straighten it before measuring crop/gutter
 //   BITONAL_INKGUTTER=1     gutter profile from the 60 % ink map instead of the lenient grey level (threshold once)
+//   BITONAL_SLOTBOX=1       (#55) per slot after deskew and band whitening: crop to all remaining ink, then place the text
+//                           block (content_box) centred / top-aligned on one canvas that fits every slot's ink, instead of
+//                           centring the whole slot (docs/rust-port.md section 8)
 //   BITONAL_OSD=tesseract   orientation by Tesseract OSD (as bash) instead of the own detector (#30); --osd-eval prints its accuracy
 //                           (EVAL_UPRIGHT=1: the input pages are upright, no Tesseract truth; #45)
 // --detect-eval a.pdf [b.pdf ...] prints candidate picture/colour signals per page and tile as TSV (#43, docs/rust-port.md section 4).
@@ -61,6 +64,7 @@ const CROP_NEAR_FRAC: f64 = 0.08;
 const CROP_BAND_FRAC: f64 = 0.10;
 const CROP_EDGE_FRAC: f64 = 0.015;
 const CROP_PAD_FRAC: f64 = 0.012;
+const TIGHT_RIM: f32 = 0.03; // BITONAL_SLOTBOX: white rim around a slot before its box is measured (> CROP_EDGE_FRAC)
 const BLUR_SIGMA: f32 = 30.0; // px at the output dpi, like bash's -blur 0x30
 const SKEW_MAX_DEG: f32 = 10.0;
 
@@ -96,6 +100,7 @@ struct Cfg {
     slot_flat: bool,
     deskew_first: bool,
     ink_gutter: bool,
+    slot_box: bool,
     timing: bool,
     tess: bool, // BITONAL_OSD=tesseract: the old detector
 }
@@ -134,6 +139,7 @@ fn main() {
         slot_flat: env("BITONAL_SLOTFLAT"),
         deskew_first: env("BITONAL_DESKEW_FIRST"),
         ink_gutter: env("BITONAL_INKGUTTER"),
+        slot_box: env("BITONAL_SLOTBOX"),
         timing: env("BITONAL_TIMING"),
         tess: std::env::var("BITONAL_OSD").as_deref() == Ok("tesseract"),
     };
@@ -205,8 +211,10 @@ fn main() {
     }
 
     // Pass B: cut, deskew, centre on the canvas, flatten + threshold, G4.
-    let pages: Vec<(u32, u32, Vec<u8>)> =
+    let slots: Vec<(u32, u32, Vec<u8>, [usize; 2])> =
         par_pages(&data, n, |p, i| finish(p, i, &metas[i], plans[i], (tw, th), &cfg)).into_iter().flatten().collect();
+    let pages: Vec<(u32, u32, Vec<u8>)> =
+        if cfg.slot_box && cfg.crop { compose(slots) } else { slots.into_iter().map(|(w, h, g, _)| (w, h, g)).collect() };
     let t2 = Instant::now();
     if cfg.timing {
         eprintln!("pass A {} ms, pass B {} ms", (t1 - t0).as_millis(), (t2 - t1).as_millis());
@@ -290,7 +298,7 @@ fn measure(page: &Page, i: usize, cfg: &Cfg) -> Meta {
     let mut m = Meta { rot, angle, w, cand: w as f64 / h as f64 >= DOUBLE_AR_MIN, ..Default::default() };
     let mut bx = (0, flat.w);
     if cfg.crop || cfg.split != Split::Off {
-        let [x0, y0, x1, y1] = content_box(&ink, flat.w, flat.h);
+        let [x0, y0, x1, y1] = content_box(&ink, flat.w, flat.h, true);
         m.trim = Some([x0 as i64 * kk, y0 as i64 * kk, (x1 as i64 * kk).min(w), (y1 as i64 * kk).min(h)]);
         bx = (x0, x1);
     }
@@ -373,7 +381,8 @@ fn plan(metas: &[Meta], cfg: &Cfg) -> (Vec<Plan>, Vec<usize>) {
 }
 
 /// Pass B: one or two finished slots (w, h, G4) for a page.
-fn finish(page: &Page, i: usize, m: &Meta, plan: Plan, (tw, th): (i64, i64), cfg: &Cfg) -> Vec<(u32, u32, Vec<u8>)> {
+/// BITONAL_SLOTBOX: instead of G4, the slot's ink box packed 1 bit/px plus the text block's anchor in it (centre x, top y).
+fn finish(page: &Page, i: usize, m: &Meta, plan: Plan, (tw, th): (i64, i64), cfg: &Cfg) -> Vec<(u32, u32, Vec<u8>, [usize; 2])> {
     let t0 = Instant::now();
     let mut src = load(page, cfg, m.rot);
     let t1 = Instant::now();
@@ -389,6 +398,7 @@ fn finish(page: &Page, i: usize, m: &Meta, plan: Plan, (tw, th): (i64, i64), cfg
         Plan::Box(b) => vec![b],
         Plan::Split([x0, y0, x1, y1], gx) => vec![[x0, y0, gx, y1], [gx, y0, x1, y1]],
     };
+    let tight = cfg.slot_box && cfg.crop && !matches!(plan, Plan::Whole);
     let extent = tw > 0 && !matches!(plan, Plan::Whole);
     let mut angles = vec![];
     let out = boxes
@@ -403,20 +413,83 @@ fn finish(page: &Page, i: usize, m: &Meta, plan: Plan, (tw, th): (i64, i64), cfg
                 0.0
             };
             angles.push(angle);
-            let (cw, ch) = if extent { (tw as usize, th as usize) } else { (s.w, s.h) };
+            let (cw, ch) = if tight {
+                // own size, enlarged so no corner is cut, plus a white rim so content_box's edge rules never bite
+                let (sn, cs) = angle.to_radians().abs().sin_cos();
+                let (w, h) = (s.w as f32, s.h as f32);
+                let rim = 2.0 * TIGHT_RIM * w.max(h);
+                ((w * cs + h * sn + rim).ceil() as usize, (h * cs + w * sn + rim).ceil() as usize)
+            } else if extent {
+                (tw as usize, th as usize)
+            } else {
+                (s.w, s.h)
+            };
             let mut c = rotate(&s, angle, cw, ch, 1.0);
             if cfg.slot_flat {
                 c = flatten(&c, BLUR_SIGMA);
             }
             let mut bits = hyst(&c, cfg.thresh);
             clear_edge_bands(&mut bits, c.w, c.h);
-            (c.w as u32, c.h as u32, encode_g4(&bits, c.w as u32))
+            if tight {
+                // Position from the text block (no band rule: the bands are whitened already, and at the pre-crop's
+                // edge it cut headings and first lines), but crop only to all remaining ink: content_box as a crop
+                // dropped page numbers, margin labels and long lines (section 8).
+                let [ax0, ay0, ax1, ay1] = content_box(&bits, c.w, c.h, false);
+                let (mut x0, mut y0, mut x1, mut y1) = (c.w, c.h, 0, 0);
+                for y in 0..c.h {
+                    for x in 0..c.w {
+                        if bits[y * c.w + x] {
+                            (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x + 1), y1.max(y + 1));
+                        }
+                    }
+                }
+                // the box always holds the text block (padded, maybe past the last ink), so the anchor is inside it
+                let (x0, y0, x1, y1) = (x0.min(ax0), y0.min(ay0), x1.max(ax1), y1.max(ay1));
+                let (w, h) = (x1 - x0, y1 - y0);
+                let mut packed = vec![0u8; w.div_ceil(8) * h];
+                for y in 0..h {
+                    for x in 0..w {
+                        if bits[(y0 + y) * c.w + x0 + x] {
+                            packed[y * w.div_ceil(8) + x / 8] |= 0x80 >> (x % 8);
+                        }
+                    }
+                }
+                return (w as u32, h as u32, packed, [((ax0 + ax1) / 2).saturating_sub(x0), ay0 - y0]);
+            }
+            (c.w as u32, c.h as u32, encode_g4(&bits, c.w as u32), [0, 0])
         })
         .collect();
     if cfg.timing {
         eprintln!("B page {}: get {} ms, rest {} ms, deskew {:?}", i + 1, (t1 - t0).as_millis(), t1.elapsed().as_millis(), angles);
     }
     out
+}
+
+/// BITONAL_SLOTBOX (#55): packed 1-bit ink boxes with their text-block anchor -> one canvas; every anchor lands on the
+/// same centre x and top y, the canvas is just big enough for all of them plus a margin, then G4. Pure bit placement.
+// ponytail: one slot with ink far from its text block (an edge band that was not whitened) widens every page
+fn compose(slots: Vec<(u32, u32, Vec<u8>, [usize; 2])>) -> Vec<(u32, u32, Vec<u8>)> {
+    let ext = |f: &dyn Fn(usize, usize, [usize; 2]) -> usize| slots.iter().map(|s| f(s.0 as usize, s.1 as usize, s.3)).max().unwrap_or(0);
+    let half = ext(&|w, _, a| a[0].max(w - a[0]));
+    let (top, bot) = (ext(&|_, _, a| a[1]), ext(&|_, h, a| h - a[1]));
+    let (mx, my) = ((CROP_PAD_FRAC * 2.0 * half as f64) as usize, (CROP_PAD_FRAC * (top + bot) as f64) as usize);
+    let (cw, ch) = (2 * half + 2 * mx, top + bot + 2 * my);
+    let place = |(w, h, p, a): &(u32, u32, Vec<u8>, [usize; 2])| {
+        let (w, h) = (*w as usize, *h as usize);
+        let (ox, oy, stride) = (mx + half - a[0], my + top - a[1], w.div_ceil(8));
+        let mut bits = vec![false; cw * ch];
+        for y in 0..h {
+            for x in 0..w {
+                bits[(oy + y) * cw + ox + x] = p[y * stride + x / 8] & (0x80 >> (x % 8)) != 0;
+            }
+        }
+        (cw as u32, ch as u32, encode_g4(&bits, cw as u32))
+    };
+    let k = slots.len().div_ceil(std::thread::available_parallelism().map_or(4, |n| n.get()));
+    std::thread::scope(|s| {
+        let hs: Vec<_> = slots.chunks(k.max(1)).map(|c| s.spawn(move || c.iter().map(place).collect::<Vec<_>>())).collect();
+        hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
+    })
 }
 
 fn die(msg: &str) -> ! {
@@ -731,9 +804,9 @@ fn q8(v: f64) -> f64 {
 
 /// Text-block bounds [x0, y0, x1, y1) of an ink map: rows first, then columns inside the row range
 /// (port of bitonalpdf.sh content_box, see docs/lessons.md 1, 4, 6, 6b).
-fn content_box(ink: &[bool], w: usize, h: usize) -> [usize; 4] {
+fn content_box(ink: &[bool], w: usize, h: usize, band: bool) -> [usize; 4] {
     let rows: Vec<f64> = (0..h).map(|y| q8(ink[y * w..(y + 1) * w].iter().filter(|&&b| b).count() as f64 / w as f64)).collect();
-    let (y0, ht) = axis_box(&rows);
+    let (y0, ht) = axis_box(&rows, band);
     let sc = ht as f64 / h as f64;
     let mut cnt = vec![0usize; w];
     for y in y0..y0 + ht {
@@ -742,12 +815,12 @@ fn content_box(ink: &[bool], w: usize, h: usize) -> [usize; 4] {
         }
     }
     let cols: Vec<f64> = cnt.iter().map(|&c| q8(c as f64 / ht as f64) * sc).collect();
-    let (x0, wd) = axis_box(&cols);
+    let (x0, wd) = axis_box(&cols, band);
     [x0, y0, x0 + wd, y0 + ht]
 }
 
 /// One axis of content_box: (first, length). Literal port of the awk, including its integer truncations.
-fn axis_box(dens: &[f64]) -> (usize, usize) {
+fn axis_box(dens: &[f64], band_rule: bool) -> (usize, usize) {
     let n = dens.len() as i64;
     let nf = n as f64;
     let ok = |i: i64, lo: f64| i >= 0 && i < n && dens[i as usize] >= lo && dens[i as usize] <= CROP_MAX_DENSITY;
@@ -776,11 +849,11 @@ fn axis_box(dens: &[f64]) -> (usize, usize) {
     }
     let band = (CROP_BAND_FRAC * nf) as i64;
     let (mut lo_lim, mut hi_lim) = (e0, n - 1 - e0);
-    if runs.len() >= 2 && runs[0].1 <= band {
+    if band_rule && runs.len() >= 2 && runs[0].1 <= band {
         lo_lim = runs[0].1 + 1;
         runs.remove(0);
     }
-    if runs.len() >= 2 && runs.last().unwrap().0 >= n - 1 - band {
+    if band_rule && runs.len() >= 2 && runs.last().unwrap().0 >= n - 1 - band {
         hi_lim = runs.pop().unwrap().0 - 1;
     }
     let block = if runs.is_empty() { all } else { Some((runs[0].0, runs.last().unwrap().1)) };
@@ -1428,7 +1501,7 @@ mod tests {
                     || (y >= 1180 && y < 1200 && x >= 490 && x < 510) // page number
             })
             .collect();
-        let [x0, y0, x1, y1] = content_box(&ink, w, h);
+        let [x0, y0, x1, y1] = content_box(&ink, w, h, true);
         assert!(y0 > 100 && y0 < 200, "{y0}");
         assert!(y1 > 1200, "{y1}");
         assert!(x0 < 150 && x1 > 850);

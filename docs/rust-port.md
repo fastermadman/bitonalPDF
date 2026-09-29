@@ -1008,3 +1008,66 @@ component that tall. The slot size is unchanged (whitening, not cropping, so all
   the component is wider than 30 % of the slot and is left alone. The text of p43 is not touched.
 - Whitening leaves the box where it was; text is not centred or aligned across pages. Order of passes, cropping vs
   whitening and alignment are #55.
+
+## 8. Order of passes and a per-slot box (#55)
+
+Question: in what order and in how many passes should rotate → crop → split → deskew → align → crop run, so that the dark
+edge between the cut and the text goes away and the text sits at the same place on every page? **Status: the order is
+decided and built behind `BITONAL_SLOTBOX=1` (off by default, output unchanged). The box that decides what to keep is not
+solved.** Four variants were measured and looked at, and each fails a goal. The next step is below.
+
+Measured by `runner` (numbers) and looked at by `checker` (pages), all four flags, f1–f7 and `tests/real/`. The scripts
+are in the session scratchpad, not committed: `suite.sh` = run + `tests/measure.sh` + `tests/edge-bands.py`, plus a
+per-column profile at 300 dpi. |L−R| = left minus right ink margin in mm (`measure.sh` ink box × page width). std x0/y0 =
+spread of the ink box position over the pages, ‰.
+
+### Order (decided)
+1. **Pass A, per spread, unchanged:** get → orientation → flatten → ink map → spread box → gutter. The spread box is now only
+   a *pre-crop*. It removes the surround cheaply (this is the owner's "crop to the white", which already exists), and it
+   gives the gutter its search window (#46). Deskewing the whole spread first stays rejected: the halves skew in opposite
+   directions (section 2).
+2. **Plan, unchanged:** medians and split. The canvas is **not** fixed here any more.
+3. **Pass B, per slot:** cut → deskew angle → rotate onto the slot's **own enlarged size** (w·cos+h·sin, plus a 3 % white
+   rim, so no corner is cut and `content_box`'s 1.5 % edge rule never bites) → threshold → `clear_edge_bands` →
+   **measure the box on the deskewed, cleaned bits** → keep that box packed 1 bit/px (about 1 MB per slot).
+4. **Compose, new, no decode:** once every slot is known, one canvas, each slot placed by an integer shift (centred
+   horizontally, top-aligned: the owner's choice), then G4 in parallel.
+
+This is Scan Tailor's order (select content per page after deskew, then margins), with no third pass: keeping the bits
+costs nothing in time (skewed 6.07 → 6.15 s, sidste 2.37 → 2.31 s wall). Re-decoding would add about 100 %.
+**Crop vs whiten:** both. Whiten what `clear_edge_bands` finds, then crop, and let the canvas keep all pages one size.
+Without `--crop` the path is untouched (byte-identical).
+
+### Variants of the box in step 3 (what did not work)
+| | f1 >2 mm (max) | f3 >2 mm (max) | f4 >2 mm (max) | f7 >2 mm (max) | std y0 f1 / f3 | page f1 (pt) | lost content (checker) |
+|---|---|---|---|---|---|---|---|
+| main | 24 (12.4) | 14 (27.1) | 6 (33.2) | 3 (4.2) | 26.9 / 59.2 | 575×724 | – |
+| v1 crop to `content_box`, band rule off | 13 (2.8) | 0 (1.3) | 0 (1.4) | 2 (2.3) | 7.1 / 2.4 | 576×736 | **bottom page numbers on 8 pages** (ryg p2, skewed p8/13/15/17/20, flerspaltet p9, f1 p3), f2 p2 "147", f1 p11 margin labels; long lines cut on f3 p2/p3, f7 p3 (title), flerspaltet p1 |
+| band rule on | 6 (7.4) | 1 (2.7) | 0 (0.5) | 4 (2.7) | 9.4 / 12.6 | 524×689 | headings and first lines on most f4/f7 pages, running heads + page numbers f1 p1–4/43/45 (all at the pre-crop's top/bottom edge, inside the 10 % band zone) |
+| v2 = v1 + band rule on columns only + every inked gutter-side column | 14 (2.8) | 1 (2.7) | 1 (17.0) | 7 (2.7) | 7.1 / 9.9 | 576×736 | column rule removed nothing on f1 (the rules sit at 10–15 % of the slot, outside the zone); spine scraps pulled in (f4 p10, f6 p1) |
+| v3 = v1 + gutter side tightened only to pass A's ink-free run | 26 (12.6) | 8 (32.0) | 4 (31.7) | 2 (10.4) | 7.0 / 2.4 | 576×736 | the lenient-grey gutter run is much narrower than the real white space, so centring breaks |
+| **v4 (in the code)**: position from `content_box`, crop to all remaining ink | 28 (80.4) | 2 (65.1) | 7 (34.3) | 13 (84.1) | 19.9 / 40.0 | **770×792** | footers back (ryg ok, skewed 45/46), but stray ink far from the text (rules not whitened, scraps at the cut) widens the canvas for every page, +34 % on f1 and +46 % on f7 |
+
+Also measured on every variant: one page size per file, `cargo test` 8/8, `tests/edge-bands.py` f1 1 → 0 (v1, v4). f2's
+cover stays flagged (not a band). By eye, the bands on f1 p19/p23/p43/p45 are **unchanged in every variant**: joined to
+the page edge, or thin rules shorter than 60 % of the slot, so `clear_edge_bands` leaves them. v1 centred well (checker:
+within about 5 px), but the top margin still jumped 20–50 px where a stray dash or a partial line sat above the heading.
+
+**Lesson:** `content_box` finds a *text block*. It drops sparse things by design (the minimum density, the 8 % near
+window, the band rule). That was harmless in pass A, where the spread geometry left slack around the box. As an exact
+crop it loses page numbers and long lines. "All ink" goes the other way: it keeps every scrap and lets one of them set the
+page size. Neither is "what to keep".
+
+### Next step (stays with Opus: design still open)
+The missing piece is a per-slot keep rule on **connected components** of the cleaned, deskewed bits (the labelling
+`clear_edge_bands` already does):
+- keep the text block (`content_box`, the anchor for position);
+- keep components near it: within a small distance, text-sized, or on a row/column the block already spans. This covers
+  page numbers below, margin labels beside, and a long title line;
+- drop components that touch the slot's outer edge or the cut, and thin tall rules in the outer zone, whatever their length.
+
+Box = union of what is kept; compose as v4. Done when: no page number, heading or line lost against main (checker on the
+pages in the table), page size within about +5 % of main, |L−R| ≤ 2 mm and std y0 below main on f1/f3/f4/f7, f1
+p13/p19/p43 without a band, time +≤20 %. Then a Sonnet issue can make it the default: drop the knob, add a `cargo test`
+(page number kept in a pre-cropped slot, margins equal), re-record the facts after a checker look (the owner accepted
+giving up bash position parity).
