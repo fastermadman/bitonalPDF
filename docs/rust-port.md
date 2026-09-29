@@ -1013,8 +1013,8 @@ component that tall. The slot size is unchanged (whitening, not cropping, so all
 
 Question: in what order and in how many passes should rotate → crop → split → deskew → align → crop run, so that the dark
 edge between the cut and the text goes away and the text sits at the same place on every page? **Status: the order is
-decided and built behind `BITONAL_SLOTBOX=1` (off by default, output unchanged). What to keep is decided per connected
-component (`keep_box`, v9 below).** It meets the goals except two page numbers beside a running head on f1 (see the end).
+decided and **the default with `--crop`** (#60, the knob `BITONAL_SLOTBOX` is gone). What to keep is decided per connected
+component (`keep_box`, v10 below).** It meets the goals; the one open defect is a page number cut off before `keep_box` (see the end).
 
 Measured by `runner` (numbers) and looked at by `checker` (pages), all four flags, f1–f7 and `tests/real/`. The scripts
 are in the session scratchpad, not committed: `suite.sh` = run + `tests/measure.sh` + `tests/edge-bands.py`, plus a
@@ -1089,12 +1089,25 @@ design bar, heading, line and picture present except the two above; top of the t
 the OPLYSNING side label, a neighbour-page slice already in main), not scraps. Bands: removed or reduced on most pages;
 f1 p43, f2 p3/p5, f6 p1 keep a bottom curl or left bar as in main (joined to text or not thin enough), none is new.
 
-**Still lost:** a page number *beside* the running head on the outer side (f1 p3 "14", f1 p18 "29"). The head is inside the
-text block, so the header/footer rule does not see it, and reaching further sideways at the block's top would pull the
-dotted edge rule back in on f1 (it sits just outside those numbers).
+### v10: page numbers beside the running head (#60), made default
+The running head is inside the text block, so the header/footer join never saw a number on its line. A second, single pass
+after the join has converged adds a letter-sized piece (at least l/2 tall) whose rows are within 1.5 l of the top or the bottom
+of the kept text lines (measured from kept pieces at least l/2 tall, so a dash above the head does not move the line), from up
+to `KEEP_HEAD_D` = 24 l sideways (f1 p3: 18 l; the header/footer zone's 12 l was too short). Guard: not when 3 or more other
+narrow pieces (≤ 3 l wide, rule segments included) stand in its columns, spread over more than `KEEP_RULE_FRAC` of the slot
+height: that is a dotted rule. Two things that did not work and why: (1) letting the pass iterate, the kept number enlarged
+the box and a rule dot 3.5 l beyond it joined by the ordinary near rule, and the rest of the rule followed (f1 p5, p11);
+(2) measuring the head line from the kept box's top, a thin dash above the head put the line 130 px too high (f1 p3).
+The pass only applies the head-line rule, no near/zone joins.
 
-### Hand-over: #60 (the two numbers first, then default)
-Sonnet issue: make `BITONAL_SLOTBOX` the default, drop the knob and the old slot centring, keep the constants. Done when:
-`cargo test` gets `keep_box` cases (a page number far below a pre-cropped block kept; a thin full-height rule at the edge
-dropped; a page number on the cut edge kept), `tests/real.sh` facts re-recorded after a checker look (the owner accepted
-giving up bash position parity), the v9 row above reproduced, `tests/synth.sh` still PASS.
+Reproduced (`tests/slotbox-suite.sh`, now the default): f1 4 pages > 2 mm (max 20.2), f3/f4/f5 0, f7 5 (11.9), std y0 f1 0.9 /
+f3 15.5, page f1 583×736, edge bands 0 on every file, `cargo test` 12/12 (new: `keep_box` page number far below / on the cut
+edge / thin edge rule dropped / head number vs dotted column, `compose` equal margins), `tests/synth.sh` all PASS,
+`tests/real.sh`: page count and footers as main except skewed p34/35/43/44 and flerspaltet p1 (as v9), facts re-recorded
+after a checker look. Checker against main: f1 p3 "14", p5 "16", p24, p28, p38, p46 numbers now present; every page number,
+head, label, title of the list in #60 present; no edge rule or blob that main lacks; f1 p1/p11/p13/p43's left dotted rule
+is unchanged from v9. f6 p2 gets one 1 px, 15 px tall tick beside the page number. f5 p1: the masthead strip cut off at the
+top of the cover is dropped (a big piece at a cut side, as in v9).
+
+**Still open:** f1 p18 "29" and p24 "35" are cut off (p18 at the right edge, p24 at the bottom) already in the plan box, before
+`keep_box` sees the slot; main clips them the same way. Widening the crop/split plan box is a separate change.
