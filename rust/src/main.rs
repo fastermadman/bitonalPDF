@@ -485,7 +485,9 @@ fn finish(page: &Page, i: usize, m: &Meta, plan: Plan, (tw, th): (i64, i64), cfg
 /// when it is a letter above/below the text block within KEEP_ZONE_D letters sideways (a page number beside the head).
 /// Never kept: big sparse pieces reaching out of the block (book edges, frames); pieces bigger than 3 letters within
 /// 2 px of a cut side of the slot (`near_edge`), or thin and longer than KEEP_RULE_FRAC of it, unless they reach the
-/// middle half of the block or there are more than KEEP_EDGE_MAX of them (a cover: the edge rule is off, #66). Everything not kept is whitened; returns the kept box, padded like content_box.
+/// middle half of the block, or unless more than KEEP_EDGE_MAX big pieces touch a cut side (a cover: the edge rule is off,
+/// #66; the threshold is a rule of thumb measured on f1-f7).
+/// Everything not kept is whitened; returns the kept box, padded like content_box.
 // ponytail: distance to the kept box, not to each component: a big picture's box can pull in scraps beside it
 fn keep_box(bits: &mut [bool], w: usize, h: usize, a: [usize; 4], near_edge: &dyn Fn(usize, usize) -> bool, dmul: f64, log: Option<(usize, usize)>) -> [usize; 4] {
     let (lab, comps) = components(bits, w, h);

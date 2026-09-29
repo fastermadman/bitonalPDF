@@ -1111,3 +1111,15 @@ top of the cover is dropped (a big piece at a cut side, as in v9).
 
 **Still open:** f1 p18 "29" and p24 "35" are cut off (p18 at the right edge, p24 at the bottom) already in the plan box, before
 `keep_box` sees the slot; main clips them the same way. Widening the crop/split plan box is a separate change.
+
+### Covers: the edge rule is off when many pieces touch a cut (#66)
+
+`keep_box` whitened masthead, date line and the circle text on f5 p1 as `edge+big` (a big piece within 2 px of a cut side):
+on a cover the text runs off the slot, so it touches the cut. New rule: when **more than 16 big pieces** (`KEEP_EDGE_MAX`)
+touch a cut side, `edge+big` is off for that slot (a book edge is a few long pieces, content running off is many). Frames
+and rules are unchanged. The 16 was measured on the seven files: 26 on f5 p1, at most 12 anywhere else. It is a rule of
+thumb and can fail on covers with fewer such pieces; those stay whitened. Effect on f1–f7 and `tests/real`: only f5 differs
+from main (`tests/verify.sh`), `BITONAL_WHITENED=1` lists the same rows on all other files. Result on f5 p1, judged by `checker` against the source: date line partly readable (was unreadable), masthead still
+unreadable (a few clipped black bars), circle text still missing (that area is white in the output, as in main). So the rule
+lets the pieces through but does not by itself make masthead and circle legible; #66 stays open for that. Not this issue: the
+cover photo is rendered badly by the threshold (identical in main).
