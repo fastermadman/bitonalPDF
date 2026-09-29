@@ -90,6 +90,10 @@ PDF directly, not any embedded text layer) and only matters for reading the PDF 
 
 [AGPL-3.0](LICENSE). `poppler` and `imagemagick` are run as separate programs, not linked.
 
+### Third-party licences
+
+The Rust binary links `jpeg-encoder` ((MIT OR Apache-2.0) AND IJG). This software is based in part on the work of the Independent JPEG Group.
+
 ## App icon
 
 macOS 26 puts legacy `.icns` icons in a grey plate. The icon is therefore an Icon Composer document
