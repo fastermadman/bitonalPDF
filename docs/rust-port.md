@@ -1093,7 +1093,7 @@ f1 p43, f2 p3/p5, f6 p1 keep a bottom curl or left bar as in main (joined to tex
 text block, so the header/footer rule does not see it, and reaching further sideways at the block's top would pull the
 dotted edge rule back in on f1 (it sits just outside those numbers).
 
-### Hand-over (after the owner decides on the two numbers)
+### Hand-over: #60 (the two numbers first, then default)
 Sonnet issue: make `BITONAL_SLOTBOX` the default, drop the knob and the old slot centring, keep the constants. Done when:
 `cargo test` gets `keep_box` cases (a page number far below a pre-cropped block kept; a thin full-height rule at the edge
 dropped; a page number on the cut edge kept), `tests/real.sh` facts re-recorded after a checker look (the owner accepted
