@@ -884,6 +884,10 @@ On a real page (f1 = Allan Poulsen, input pages 0 and 5, 2150×1518 px at 150 dp
 (first run 84/88, then 71–74), encode **20 ms** every run, 351 583 and 329 211 B [measured]. The synthetic page is the smaller case
 (2.2 vs 3.3 MP): the real page costs 1.5× as much to encode, and the render is 3.5× the encode, so keeping the RGB is the larger part of the ≈ 0.1 s per colour page.
 
+All of f1–f7 (pages 4, 5 and 9 where they exist, 3 runs each; Korsgaard has 4 pages and was not measured): encode 14 ms at 1240×1754 or 1755×1242
+(Davidsen Helle, Frederiksen, Juellund), 20–23 ms at 2150×1518 (f1, Jeppe Sinding, Tosprogede), 226–513 kB per page; render to RGB 29–49 ms
+and 55–105 ms respectively [measured]. Encode is about linear in pixels; the render is 2–4× the encode.
+
 ### 5.7 Recommendation: go with reservations
 **Go** for **page-level mixed output with a page list**: text mode, plus MODE=images pages where the user lists them (`--colour-pages`), and
 `auto` as a printed suggestion. It halves MODE=images on this material (1.83× vs 3.46× text) with no new PDF construct and one new crate.
