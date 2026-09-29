@@ -1013,8 +1013,8 @@ component that tall. The slot size is unchanged (whitening, not cropping, so all
 
 Question: in what order and in how many passes should rotate → crop → split → deskew → align → crop run, so that the dark
 edge between the cut and the text goes away and the text sits at the same place on every page? **Status: the order is
-decided and built behind `BITONAL_SLOTBOX=1` (off by default, output unchanged). The box that decides what to keep is not
-solved.** Four variants were measured and looked at, and each fails a goal. The next step is below.
+decided and built behind `BITONAL_SLOTBOX=1` (off by default, output unchanged). What to keep is decided per connected
+component (`keep_box`, v9 below).** It meets the goals except two page numbers beside a running head on f1 (see the end).
 
 Measured by `runner` (numbers) and looked at by `checker` (pages), all four flags, f1–f7 and `tests/real/`. The scripts
 are in the session scratchpad, not committed: `suite.sh` = run + `tests/measure.sh` + `tests/edge-bands.py`, plus a
@@ -1046,7 +1046,7 @@ Without `--crop` the path is untouched (byte-identical).
 | band rule on | 6 (7.4) | 1 (2.7) | 0 (0.5) | 4 (2.7) | 9.4 / 12.6 | 524×689 | headings and first lines on most f4/f7 pages, running heads + page numbers f1 p1–4/43/45 (all at the pre-crop's top/bottom edge, inside the 10 % band zone) |
 | v2 = v1 + band rule on columns only + every inked gutter-side column | 14 (2.8) | 1 (2.7) | 1 (17.0) | 7 (2.7) | 7.1 / 9.9 | 576×736 | column rule removed nothing on f1 (the rules sit at 10–15 % of the slot, outside the zone); spine scraps pulled in (f4 p10, f6 p1) |
 | v3 = v1 + gutter side tightened only to pass A's ink-free run | 26 (12.6) | 8 (32.0) | 4 (31.7) | 2 (10.4) | 7.0 / 2.4 | 576×736 | the lenient-grey gutter run is much narrower than the real white space, so centring breaks |
-| **v4 (in the code)**: position from `content_box`, crop to all remaining ink | 28 (80.4) | 2 (65.1) | 7 (34.3) | 13 (84.1) | 19.9 / 40.0 | **770×792** | footers back (ryg ok, skewed 45/46), but stray ink far from the text (rules not whitened, scraps at the cut) widens the canvas for every page, +34 % on f1 and +46 % on f7 |
+| v4: position from `content_box`, crop to all remaining ink | 28 (80.4) | 2 (65.1) | 7 (34.3) | 13 (84.1) | 19.9 / 40.0 | **770×792** | footers back (ryg ok, skewed 45/46), but stray ink far from the text (rules not whitened, scraps at the cut) widens the canvas for every page, +34 % on f1 and +46 % on f7 |
 
 Also measured on every variant: one page size per file, `cargo test` 8/8, `tests/edge-bands.py` f1 1 → 0 (v1, v4). f2's
 cover stays flagged (not a band). By eye, the bands on f1 p19/p23/p43/p45 are **unchanged in every variant**: joined to
@@ -1058,16 +1058,43 @@ window, the band rule). That was harmless in pass A, where the spread geometry l
 crop it loses page numbers and long lines. "All ink" goes the other way: it keeps every scrap and lets one of them set the
 page size. Neither is "what to keep".
 
-### Next step (stays with Opus: design still open)
-The missing piece is a per-slot keep rule on **connected components** of the cleaned, deskewed bits (the labelling
-`clear_edge_bands` already does):
-- keep the text block (`content_box`, the anchor for position);
-- keep components near it: within a small distance, text-sized, or on a row/column the block already spans. This covers
-  page numbers below, margin labels beside, and a long title line;
-- drop components that touch the slot's outer edge or the cut, and thin tall rules in the outer zone, whatever their length.
+### The keep rule per component (v5–v9, in the code)
+`keep_box` labels the connected components of the cleaned, deskewed slot and decides for each one (l = median letter
+height inside the text block, d = 4 l, `BITONAL_KEEP_D`):
+- **seeds:** components that meet the text block (`content_box`, band rule off);
+- **join, repeated until nothing changes:** anything within d of the kept box; anything straight above/below it (inside
+  its columns) at any distance if it is more than a speck (l²/8 px): page numbers, running heads, footnotes; a letter-sized
+  piece above/below the text block within 12 l sideways (a page number centred under a one-column page);
+- **never:** big sparse pieces (< 10 % filled, > 100 l²) reaching out of the block (book edges, the L on f7 p3); pieces
+  larger than 3 l within 2 px of a *cut* side of the slot (a side where the pre-crop reached the page edge is not a cut:
+  a cover runs off the page); thin pieces longer than 25 % of the slot (rules; f7 p4's 160 px design bar is shorter).
+  The last two do not apply when the piece reaches the middle half of the block (a full-bleed picture).
+- Everything not kept is whitened, the box is the kept ink + the content_box pad, and compose centres it and aligns its top.
 
-Box = union of what is kept; compose as v4. Done when: no page number, heading or line lost against main (checker on the
-pages in the table), page size within about +5 % of main, |L−R| ≤ 2 mm and std y0 below main on f1/f3/f4/f7, f1
-p13/p19/p43 without a band, time +≤20 %. Then a Sonnet issue can make it the default: drop the knob, add a `cargo test`
-(page number kept in a pre-cropped slot, margins equal), re-record the facts after a checker look (the owner accepted
-giving up bash position parity).
+| | f1 >2 mm (max) | f3 | f4 | f5 | f7 >2 mm (max) | std y0 f1 / f3 | page f1 (pt) | lost content (checker) |
+|---|---|---|---|---|---|---|---|---|
+| main | 24 (12.4) | 14 (27.1) | 6 (33.2) | 0 (0.6) | 3 (4.2) | 26.9 / 59.2 | 575×724 | – |
+| v5: seeds + join within d | 6 (22.0) | 0 | 0 | 0 | 3 (11.9) | – | 583×736 | not looked at; footer flags lost on the same pages as v1 (ryg p2, skewed p8/13/15/17/20), for d = 2, 4 and 8 l alike |
+| v6: + straight above/below within 20 % | 6 | 0 | 1 | 0 | 3 | 4.1 / 13.0 | 583×736 | f1 p3 "14", flerspaltet p9 "8", f7 p4 design bar (rule rule), f5 p1 cover strip (edge rule at the page edge); L-shaped edges kept as seeds |
+| v7: + frame rule, cut sides only, rule ≥ 25 %, any distance above/below | 5 | 0 | 1 | 0 | 4 | 2.0 / 13.8 | 583×736 | f1 p3 "14", flerspaltet p9 "8" (both touch the pre-crop edge) |
+| v8: + small pieces at a cut kept | 4 (20.2) | 0 (0.5) | 0 (0.5) | 0 (0.4) | 5 (11.9) | **0.9** / 15.5 | 583×736 | f1 p3 "14", flerspaltet p9 "8" (62 px beside a one-column page), f1 p18 clipped "29" |
+| **v9: + letters above/below the block within 12 l** | 4 (20.2) | 0 (0.5) | 0 (0.5) | 0 (0.4) | 5 (11.9) | **0.9** / 15.5 | 583×736 | **f1 p3 "14", f1 p18 clipped "29"**; skewed p1's clipped line ends of the *neighbour* page (the #40 page) |
+
+v9, all files: one page size per file, within +1.5 % (w) / +1.7 % (h) of main on f1, narrower on skewed; `tests/edge-bands.py`
+0 on every file (main: f1 p19, f2 p1); `cargo test` 8/8; time +2–5 % (skewed 5.69 → 5.98 s). `tests/real.sh`: page count and
+footers as main except skewed p34/35/43/44 (main's "footer" there was a cut-off partial line, not a page number) and flerspaltet
+p1 (title page, all content present). Checker, about 40 pages: every page number, running head, footnote, margin label,
+design bar, heading, line and picture present except the two above; top of the text at 18–24 px on every page of a series
+(main 39–96 px); horizontal position follows the layout. The remaining |L−R| outliers are content on one side (BOKS labels,
+the OPLYSNING side label, a neighbour-page slice already in main), not scraps. Bands: removed or reduced on most pages;
+f1 p43, f2 p3/p5, f6 p1 keep a bottom curl or left bar as in main (joined to text or not thin enough), none is new.
+
+**Still lost:** a page number *beside* the running head on the outer side (f1 p3 "14", f1 p18 "29"). The head is inside the
+text block, so the header/footer rule does not see it, and reaching further sideways at the block's top would pull the
+dotted edge rule back in on f1 (it sits just outside those numbers).
+
+### Hand-over (after the owner decides on the two numbers)
+Sonnet issue: make `BITONAL_SLOTBOX` the default, drop the knob and the old slot centring, keep the constants. Done when:
+`cargo test` gets `keep_box` cases (a page number far below a pre-cropped block kept; a thin full-height rule at the edge
+dropped; a page number on the cut edge kept), `tests/real.sh` facts re-recorded after a checker look (the owner accepted
+giving up bash position parity), the v9 row above reproduced, `tests/synth.sh` still PASS.
