@@ -1123,3 +1123,15 @@ from main (`tests/verify.sh`), `BITONAL_WHITENED=1` lists the same rows on all o
 unreadable (a few clipped black bars), circle text still missing (that area is white in the output, as in main). So the rule
 lets the pieces through but does not by itself make masthead and circle legible; #66 stays open for that. Not this issue: the
 cover photo is rendered badly by the threshold (identical in main).
+
+### Where the f5 p1 circle text goes (#70)
+
+Investigated, not fixed. Bits dumped for f5 p1 (canvas 2649×3255 at 300 dpi, canvas px, not the slot px of the issue) after `hyst`,
+after `clear_edge_bands` and after `keep_box`: the three dumps are identical in the circle area, so neither `clear_edge_bands` nor
+`keep_box` touches it (`keep_box` cannot whiten what is not there). In the lower-right rectangle x 1620–2540, y 2720–3100 the
+ink after `hyst` is 4193 of 350 600 px (1.2 %, speckle) and the grey input to `hyst` has mean 232/255, 5th percentile 196, 0.36 % below 100:
+the right circle's light-purple fill and its white text are already near-white before the threshold. The hard vertical edge at
+x ≈ 1615 is where the darker left circle ends and the lighter one starts, so the left circle's text stops there. The cause is
+therefore the flatten (pass B, `BLUR_SIGMA`) plus the threshold, not the keep rule, `compose` or the box. Not checked: which of
+flatten and threshold alone would keep the text, and whether the rectangle's coordinates map exactly onto the issue's range.
+The `BITONAL_WHITENED` list proves `keep_box` only, not the whole pipeline. The dump code was temporary and is not in the tree.
