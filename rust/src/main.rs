@@ -1387,7 +1387,9 @@ fn components(ink: &[bool], w: usize, h: usize) -> (Vec<u32>, Vec<(u32, f64, f64
                 continue;
             }
             let mut near = [u32::MAX; 4];
-            let nb = [(x > 0, y * w + x.wrapping_sub(1)), (x > 0 && y > 0, (y.wrapping_sub(1)) * w + x.wrapping_sub(1)), (y > 0, y.wrapping_sub(1) * w + x), (y > 0 && x + 1 < w, y.wrapping_sub(1) * w + x + 1)];
+            // Indices are built for all four neighbours before the bounds flag says which are valid: wrap on purpose, the flag guards the use.
+            let up = y.wrapping_sub(1).wrapping_mul(w);
+            let nb = [(x > 0, (y * w).wrapping_add(x.wrapping_sub(1))), (x > 0 && y > 0, up.wrapping_add(x.wrapping_sub(1))), (y > 0, up.wrapping_add(x)), (y > 0 && x + 1 < w, up.wrapping_add(x + 1))];
             for (j, (ok, k)) in nb.iter().enumerate() {
                 if *ok && ink[*k] {
                     near[j] = find(&mut parent, lab[*k]);
