@@ -1145,7 +1145,32 @@ No page number was lost against main in any variant (checker, all files). The fa
 the text widens and shifts the slot box on the pages that have one, and the wider box lets table edge and shadow in. "Include far-out
 numbers" and "suite not worse than v10" do not both hold with a plan-box change alone. Not verified: variants 1-3 on all files by
 eye (only variant 4 was looked at on every page); the vertical (y0) clip was found late and not tried. Next: #84 (let `keep_box`
-reach further out instead of widening the plan box).
+reach further out instead of widening the plan box; done, next section).
+
+### Page numbers beyond the near window: keep_box reach (#84)
+
+Instead of a wider plan box (#62), `finish` thresholds the slot again over a ring of R = 2 % of max(w, h) beyond its cut sides
+(not the gutter side of a split; the canvas grows by R each side, so ring pixels map to the main canvas by an integer shift and
+fit in the 3 % TIGHT_RIM). Main's `keep_box` result stays as it is; `reach` only adds whole ring pieces that look like one page
+number: letter-sized, not at a cut side of the grown box, on the header/footer line (headline or zone test; the dotted-rule
+guard only beside the kept box, since above it the columns hold the text), in a cluster (same line, gaps <= 0.3 letters) of at
+most 4 pieces with one of them anchored in ink main kept, >= 3 letters clear of other ring letters, tallest piece 1.2-1.8
+letters, at least half a letter wide.
+
+The guard was set from a dump of every ring component on f1-f7 + `tests/real`. A clipped running head is a row of letter-sized
+ring pieces (f1 p24: five head letters beside "35"; p50: 33 pieces), so a cap on the whole slot would have dropped the number;
+the head letters are 0.76-1.05 letters tall and 1.2-2.5 letters apart, the digits 1.33-1.61 and >= 17 letters from the head.
+p50's second digit lies wholly in the ring and comes in through the first. f1 p20's smear is one 86k px frame piece and
+Korsgaard p4's are 3-7 px wide slivers off the head line: both fail before the guard, so no fill test. Completing every clipped
+head/footer line would have touched 45 slots (up to 668 pieces) and is not done.
+
+Result: 6 clusters, all on f1 (p16 "27", p18 "29", p24 "35", p46 "57" (already complete in main, a few pixels more), p48 "59",
+p50 "61"), complete at 100 dpi (checker against source and main), no added mark. f2-f7 and `tests/real` are byte-identical to
+main; the other 44 f1 pages are bit-identical (same canvas 583.2 x 736.08 pt). f1 >2 mm pages [18, 19, 27, 50] as in main, std
+y0 0.24 -> 0.21 mm (without the six pages: equal to main). p18's measure.sh y1/foot flip (765 -> 914) is the 40 dpi render of the
+bottom rule after a 4 px sideways shift, not new ink. Cost: the ring build is 0-29 % wall time (f1 4.9 -> 5.8 s).
+Limits: a number with no digit reaching into the slot is not found; a lone "1" fails the width test; the running heads of
+p16, p48 and p50 stay missing (cut off by the plan box in main too).
 
 ### Covers: the edge rule is off when many pieces touch a cut (#66)
 
