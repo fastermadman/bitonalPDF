@@ -173,7 +173,8 @@ inside its 150 px wide blank spine gap. The 8 pages outside tolerance, each look
 - **skewed p1** (left half of the first spread, a nearly blank page): the text block of the right page starts at column
   2091 in both; the 8 % near-window reaches back to column 1811, which has density 1/255 in bash and 3/255 in Rust. Rust
   extends the box over a 250 px sliver of the left page's line ends, bash mirrors the right page's width. Both cut the few
-  lines on that page; bash shows more of them. A cliff of the crop rule, not of the port (below).
+  lines on that page; bash shows more of them. A cliff of the crop rule, not of the port (below). Fixed by #88 (§8,
+  "A sparse facing page").
 - **sidste p1** (blank facing page): 2–3 specks instead of 1.
 - **sidste p7/8/11** (the dithered 1-bit scan pages): Rust is **cleaner**: no dither dots along the edge, no spine line,
   same text, page numbers 18/19/22 present; 49–52 kB instead of 55–59 kB per page.
@@ -1122,7 +1123,7 @@ is unchanged from v9. f6 p2 gets one 1 px, 15 px tall tick beside the page numbe
 top of the cover is dropped (a big piece at a cut side, as in v9).
 
 **Still open:** f1 p18 "29" and p24 "35" are cut off already in the plan box, before `keep_box` sees the slot; main clips them the
-same way. Measured in #62; fixed by #84 (keep_box reach, two sections below). Clipped running heads: #87; skewed p1: #88.
+same way. Measured in #62; fixed by #84 (keep_box reach, two sections below). Clipped running heads: #87; skewed p1: fixed by #88.
 
 ### Page numbers beyond the near window: measured, no plan-box fix (#62)
 
@@ -1171,6 +1172,25 @@ y0 0.24 -> 0.21 mm (without the six pages: equal to main). p18's measure.sh y1/f
 bottom rule after a 4 px sideways shift, not new ink. Cost: the ring build is 0-29 % wall time (f1 4.9 -> 5.8 s).
 Limits: a number with no digit reaching into the slot is not found; a lone "1" fails the width test; the running heads of
 p16, p48 and p50 stay missing (cut off by the plan box in main too).
+
+### A sparse facing page: its own half box (#88)
+
+skewed source p1 is a spread whose left page is a chapter end: 4 lines (x 660-1830, y 280-460 at 300 dpi) and "34" (x 644-684,
+y 2363-2392). Pass A's `content_box` on the whole spread follows the right page: trim `[1768, 226, 3285, 2428]`, gutter 2071 (a
+valley). The left page's columns are too sparse for `CROP_MIN_DENSITY`, and the 8 % near window reaches back only to 1811. The
+left slot was 303 px of line ends. `plan()`'s "blank facing page: mirror" branch does not fire (x0 < gx) and would not help:
+2071 - 1214 = 857 still cuts the lines.
+
+Rule (`measure()`): when one side of the trim reaches less than `SPLIT_SLIVER_FRAC` = 0.5 of the other side's width, that half
+gets its own `content_box` on its ink alone, and the trim's outer x widens to it (x only; y stays the spread's). Over all split
+spreads in f1-f7 + `tests/real` (81 with a gutter) the ratio is 0.25 (skewed p1) and 0.31 (f7 p1, a cover), then >= 0.61, so
+0.5 is a rule of thumb from two cases, like `KEEP_EDGE_MAX`. On skewed p1 the half box starts at x 636, left of the "34".
+On f7 p1 the right half's own box ends at 2419, inside the trim's 2785, so nothing changes there.
+
+Result: skewed p1 has all 4 lines and "34" (looked at, 100 dpi, against source and main); two dust specks of 4 and 2 px at 300 dpi
+stay inside the text area. `reach` adds nothing on that slot. The other 45 skewed pages are bit-identical (G4 streams), and so is
+the canvas (329.76 x 543.6 pt). Every other file is byte-identical to main. `skewed.facts` p1 re-recorded: `483 23 516 86 0` ->
+`76 23 923 973 1`, the same box as the other left pages, footer ink now set.
 
 ### Covers: the edge rule is off when many pieces touch a cut (#66)
 
