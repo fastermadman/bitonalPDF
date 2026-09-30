@@ -12,6 +12,8 @@
 //                           the others on one canvas (compose; docs/rust-port.md section 8)
 //   BITONAL_WHITENED=1      (#63) with --crop, keep_box prints one TSV row per whitened component to stderr ("whitened" page slot
 //                           x0 y0 x1 y1 pixels letters outside reason slot_h); tests/whitened.py filters it. Off: no change.
+//                           (#84) plus one "reached" row per page number added from beyond the slot (page slot x0 y0 x1 y1
+//                           pieces height_in_letters).
 //   BITONAL_OSD=tesseract   orientation by Tesseract OSD (as bash) instead of the own detector (#30); --osd-eval prints its accuracy
 //                           (EVAL_UPRIGHT=1: the input pages are upright, no Tesseract truth; #45)
 // --detect-eval a.pdf [b.pdf ...] prints candidate picture/colour signals per page and tile as TSV (#43, docs/rust-port.md section 4).
@@ -71,6 +73,9 @@ const KEEP_ZONE_D: f64 = 12.0; // keep_box: sideways reach on the header/footer 
 const KEEP_HEAD_D: f64 = 24.0; // keep_box: sideways reach on the block's top/bottom kept line, in letter heights (f1 p3: 18)
 const KEEP_EDGE_MAX: usize = 16; // keep_box: more big pieces than this touching a cut side switch the edge rule off (cover, #66)
 const KEEP_RULE_FRAC: f64 = 0.25; // keep_box: a thin piece longer than this share of the slot height is a rule (f7 p4's bar is shorter)
+const KEEP_REACH_FRAC: f64 = 0.02; // #84: ring outside a slot's cut sides searched for page numbers; R and TIGHT_RIM use the same measure, max(w, h), so the ring fits in the rim
+const KEEP_REACH_ISO: f64 = 3.0; // #84: a reached page number stands this many letter heights clear of other ring letters (f1 p24's clipped head: 1.2-2.5)
+const KEEP_REACH_H: (f64, f64) = (1.2, 1.8); // #84: its tallest digit, in letter heights (f1 digits 1.33-1.61; head letters <= 1.05, cartoon/margin pieces >= 1.93)
 const TIGHT_RIM: f32 = 0.03; // --crop: white rim around a slot before its box is measured (> CROP_EDGE_FRAC)
 const BLUR_SIGMA: f32 = 30.0; // px at the output dpi, like bash's -blur 0x30
 const COVER_BLUR_SIGMA: f32 = 1000.0; // px, a cover slot's flatten (#71): wider than f5 p1's circles, so fills stay grey
@@ -459,7 +464,7 @@ fn finish(page: &Page, i: usize, m: &Meta, plan: Plan, (tw, th): (i64, i64), cfg
                     (cut[0] && sx < 2.0) || (cut[1] && sy < 2.0) || (cut[2] && sx > s.w as f32 - 3.0) || (cut[3] && sy > s.h as f32 - 3.0)
                 };
                 let log = cfg.whitened.then_some((i + 1, slot + 1));
-                let ([mut x0, mut y0, mut x1, mut y1], cover) = keep_box(&mut bits, c.w, c.h, a, &near_edge, cfg.keep_d, log);
+                let ([mut x0, mut y0, mut x1, mut y1], cover, (kl, kk, ktop, kbot)) = keep_box(&mut bits, c.w, c.h, a, &near_edge, cfg.keep_d, log);
                 if cover {
                     // A cover (#71): the flatten turns a fill wider than BLUR_SIGMA white, and light text on it with it (f5 p1's
                     // circles). Threshold the unflattened slot again, flattened only against light falloff, and keep from that.
@@ -473,6 +478,46 @@ fn finish(page: &Page, i: usize, m: &Meta, plan: Plan, (tw, th): (i64, i64), cfg
                     clear_edge_bands(&mut bits, rc.w, rc.h);
                     let a = content_box(&bits, rc.w, rc.h, false);
                     [x0, y0, x1, y1] = keep_box(&mut bits, rc.w, rc.h, a, &near_edge, cfg.keep_d, log).0;
+                }
+                if !cover && cut.contains(&true) {
+                    // #84: a page number the plan box clipped (f1 p18, p24, p50). The slot grown by R on its cut sides (not the
+                    // gutter: the facing page's head), same skew, canvas grown by R each side, so main canvas pixel (x, y) is ring
+                    // pixel (x + R, y + R). Main's kept ink stays as it is; reach only adds whole pieces.
+                    let tr = Instant::now();
+                    let r = (KEEP_REACH_FRAC * s.w.max(s.h) as f64) as usize;
+                    let split = matches!(plan, Plan::Split(..));
+                    let grow = [cut[0] && !(split && slot == 1), cut[1], cut[2] && !(split && slot == 0), cut[3]];
+                    let (pw, ph) = (s.w + 2 * r, s.h + 2 * r);
+                    let mut p = Img { w: pw, h: ph, px: vec![1.0; pw * ph] };
+                    for y in 0..ph {
+                        let sy = b[1] + y as i64 - r as i64;
+                        if sy < 0 || sy >= h || (sy < b[1] && !grow[1]) || (sy >= b[3] && !grow[3]) {
+                            continue;
+                        }
+                        for x in 0..pw {
+                            let sx = b[0] + x as i64 - r as i64;
+                            if sx >= 0 && sx < w && (sx >= b[0] || grow[0]) && (sx < b[2] || grow[2]) {
+                                p.px[y * pw + x] = src.px[sy as usize * src.w + sx as usize];
+                            }
+                        }
+                    }
+                    let mut rc = rotate(&p, angle, cw + 2 * r, ch + 2 * r, 1.0);
+                    if cfg.slot_flat {
+                        rc = flatten(&rc, BLUR_SIGMA);
+                    }
+                    let mut rb = hyst(&rc, cfg.thresh);
+                    clear_edge_bands(&mut rb, rc.w, rc.h);
+                    let ms = tr.elapsed().as_millis();
+                    if cfg.timing {
+                        eprintln!("R page {} slot {}: ring {} ms, R {} px, grow {:?}", i + 1, slot + 1, ms, r, grow);
+                    }
+                    if let Some(e) = reach(&rb, rc.w, rc.h, r, s.w, s.h, (ccx, ccy), (gcx, gcy), (sn, cs), grow, cut, a, (kl, kk, ktop, kbot), &mut bits, c.w, c.h, log) {
+                        let (px, py) = ((CROP_PAD_FRAC * c.w as f64) as i64, (CROP_PAD_FRAC * c.h as f64) as i64);
+                        x0 = x0.min((e[0] - px).max(0) as usize);
+                        y0 = y0.min((e[1] - py).max(0) as usize);
+                        x1 = x1.max((e[2] + px).min(c.w as i64) as usize);
+                        y1 = y1.max((e[3] + py).min(c.h as i64) as usize);
+                    }
                 }
                 let (w, h) = (x1 - x0, y1 - y0);
                 let mut packed = vec![0u8; w.div_ceil(8) * h];
@@ -505,7 +550,7 @@ fn finish(page: &Page, i: usize, m: &Meta, plan: Plan, (tw, th): (i64, i64), cfg
 /// #66; the threshold is a rule of thumb measured on f1-f7).
 /// Everything not kept is whitened; returns the kept box, padded like content_box, and whether the slot is a cover (edge rule off).
 // ponytail: distance to the kept box, not to each component: a big picture's box can pull in scraps beside it
-fn keep_box(bits: &mut [bool], w: usize, h: usize, a: [usize; 4], near_edge: &dyn Fn(usize, usize) -> bool, dmul: f64, log: Option<(usize, usize)>) -> ([usize; 4], bool) {
+fn keep_box(bits: &mut [bool], w: usize, h: usize, a: [usize; 4], near_edge: &dyn Fn(usize, usize) -> bool, dmul: f64, log: Option<(usize, usize)>) -> ([usize; 4], bool, (f64, [usize; 4], usize, usize)) {
     let (lab, comps) = components(bits, w, h);
     let n = comps.len();
     let mut bb = vec![[usize::MAX, usize::MAX, 0, 0]; n]; // x0 y0 x1 y1, exclusive
@@ -573,7 +618,7 @@ fn keep_box(bits: &mut [bool], w: usize, h: usize, a: [usize; 4], near_edge: &dy
         }
     }
     if k[2] == 0 {
-        return (a, runs_off); // nothing in the block (blank slot): keep the block's box, whiten nothing
+        return (a, runs_off, (l, a, a[1], a[3])); // nothing in the block (blank slot): keep the block's box, whiten nothing
     }
     // pass 0 grows the kept box; pass 1 adds head-line letters once and does not iterate, or a rule beside a page number
     // would be pulled in by the enlarged box (f1 p5)
@@ -629,7 +674,124 @@ fn keep_box(bits: &mut [bool], w: usize, h: usize, a: [usize; 4], near_edge: &dy
         }
     }
     let (px, py) = ((CROP_PAD_FRAC * w as f64) as usize, (CROP_PAD_FRAC * h as f64) as usize);
-    ([k[0].saturating_sub(px), k[1].saturating_sub(py), (k[2] + px).min(w), (k[3] + py).min(h)], runs_off)
+    let kl = (0..n).filter(|&j| kept[j] && (bb[j][3] - bb[j][1]) as f64 >= l / 2.0);
+    let (top, bot) = kl.fold((usize::MAX, 0), |(t, u), j| (t.min(bb[j][1]), u.max(bb[j][3])));
+    ([k[0].saturating_sub(px), k[1].saturating_sub(py), (k[2] + px).min(w), (k[3] + py).min(h)], runs_off, (l, k, top, bot))
+}
+
+/// #84: page numbers beyond the plan box. `rb` is the slot's ink thresholded again on a canvas grown by r each side, over the
+/// slot grown by r on its cut sides. Candidates: components with a pixel outside the slot, letter-sized, not within 2 px of a cut
+/// side of the grown box, on the header/footer line (keep_box's headline or zone test; beside the kept box also its dotted-rule guard). They form
+/// clusters (same line, gaps <= 0.3 letters); a cluster is added when it looks like one page number: at most 4 pieces, one of
+/// them anchored in ink main kept, KEEP_REACH_ISO letters clear of other candidates (a clipped running head is a row of them),
+/// tallest piece within KEEP_REACH_H, at least half a letter wide (not an edge sliver). Added pixels are set in `bits` (main
+/// canvas); returns the added box in main canvas coordinates.
+// ponytail: measured on f1-f7 + tests/real (6 clusters, all page numbers); a number with no digit reaching into the slot is not found
+#[allow(clippy::too_many_arguments)]
+fn reach(rb: &[bool], rw: usize, rh: usize, r: usize, sw: usize, sh: usize, (ccx, ccy): (f32, f32), (gcx, gcy): (f32, f32), (sn, cs): (f32, f32),
+    grow: [bool; 4], cut: [bool; 4], a: [usize; 4], (l, k, top, bot): (f64, [usize; 4], usize, usize), bits: &mut [bool], mw: usize, mh: usize,
+    log: Option<(usize, usize)>) -> Option<[i64; 4]> {
+    let (lab, comps) = components(rb, rw, rh);
+    let n = comps.len();
+    let mut bb = vec![[i64::MAX, i64::MAX, i64::MIN, i64::MIN]; n]; // main canvas coords
+    let (mut out, mut edge, mut seed) = (vec![false; n], vec![false; n], vec![false; n]);
+    let rf = r as f32;
+    let lim = |g: bool| if g { rf } else { 0.0 };
+    for y in 0..rh {
+        for x in 0..rw {
+            if !rb[y * rw + x] {
+                continue;
+            }
+            let i = lab[y * rw + x] as usize;
+            let (mx, my) = (x as i64 - r as i64, y as i64 - r as i64);
+            let b = &mut bb[i];
+            *b = [b[0].min(mx), b[1].min(my), b[2].max(mx + 1), b[3].max(my + 1)];
+            // same mapping as near_edge in finish: canvas pixel -> source slot pixel
+            let (u, v) = (mx as f32 + 0.5 - ccx, my as f32 + 0.5 - ccy);
+            let (sx, sy) = (gcx + u * cs - v * sn - 0.5, gcy + u * sn + v * cs - 0.5);
+            if sx < -0.5 || sy < -0.5 || sx > sw as f32 - 0.5 || sy > sh as f32 - 0.5 {
+                out[i] = true;
+            } else if mx >= 0 && my >= 0 && (mx as usize) < mw && (my as usize) < mh && bits[my as usize * mw + mx as usize] {
+                seed[i] = true;
+            }
+            if (cut[0] && sx < 2.0 - lim(grow[0])) || (cut[1] && sy < 2.0 - lim(grow[1]))
+                || (cut[2] && sx > sw as f32 - 3.0 + lim(grow[2])) || (cut[3] && sy > sh as f32 - 3.0 + lim(grow[3])) {
+                edge[i] = true;
+            }
+        }
+    }
+    let gap = |a0: i64, a1: i64, b0: i64, b1: i64| if a1 <= b0 { b0 - a1 } else if b1 <= a0 { a0 - b1 } else { 0 };
+    let (k, a) = (k.map(|v| v as i64), a.map(|v| v as i64));
+    let small = |j: usize| comps[j].0 as f64 >= l * l / 8.0 && (bb[j][2] - bb[j][0]) as f64 <= 3.0 * l;
+    // ring letters on the header/footer line; a candidate is one that is also not part of a dotted rule
+    let online: Vec<usize> = (0..n)
+        .filter(|&i| {
+            let b = bb[i];
+            let bh = b[3] - b[1];
+            let letter = comps[i].0 as f64 >= l * l / 8.0 && ((b[2] - b[0]).max(bh) as f64) <= 3.0 * l;
+            let gx = gap(b[0], b[2], k[0], k[2]);
+            let headline = bh as f64 >= l / 2.0 && gx as f64 <= KEEP_HEAD_D * l && ((b[1] as f64) < top as f64 + 1.5 * l || b[3] as f64 > bot as f64 - 1.5 * l);
+            let zone = (b[3] <= a[1] || b[1] >= a[3]) && gx as f64 <= KEEP_ZONE_D * l;
+            comps[i].0 > 0 && out[i] && !edge[i] && letter && (headline || zone)
+        })
+        .collect();
+    let cand: Vec<usize> = online
+        .iter()
+        .copied()
+        .filter(|&i| {
+            let b = bb[i];
+            // beside the kept box, not one of a dotted rule (as in keep_box); above/below it its columns hold the text
+            gap(b[0], b[2], k[0], k[2]) == 0 || {
+                let st: Vec<usize> = (0..n).filter(|&j| j != i && comps[j].0 > 0 && bb[j][0] < b[2] && b[0] < bb[j][2] && small(j)).collect();
+                let (lo, hi) = st.iter().fold((b[1], b[3]), |(lo, hi), &j| (lo.min(bb[j][1]), hi.max(bb[j][3])));
+                st.len() < 3 || (hi - lo) as f64 <= KEEP_RULE_FRAC * mh as f64
+            }
+        })
+        .collect();
+    // clusters: same line (half the smaller height overlaps), gap <= 0.3 letters
+    let mut root: Vec<usize> = (0..cand.len()).collect();
+    fn find(p: &mut [usize], mut i: usize) -> usize {
+        while p[i] != i {
+            i = p[i];
+        }
+        i
+    }
+    for p in 0..cand.len() {
+        for q in p + 1..cand.len() {
+            let (s, t) = (bb[cand[p]], bb[cand[q]]);
+            if gap(s[0], s[2], t[0], t[2]) as f64 <= 0.3 * l && (s[3].min(t[3]) - s[1].max(t[1])) * 2 >= (s[3] - s[1]).min(t[3] - t[1]) {
+                let (rp, rq) = (find(&mut root, p), find(&mut root, q));
+                root[rp] = rq;
+            }
+        }
+    }
+    let mut added: Option<[i64; 4]> = None;
+    for c in 0..cand.len() {
+        if find(&mut root, c) != c {
+            continue;
+        }
+        let m: Vec<usize> = (0..cand.len()).filter(|&p| find(&mut root, p) == c).map(|p| cand[p]).collect();
+        let e = m.iter().fold([i64::MAX, i64::MAX, i64::MIN, i64::MIN], |e, &i| [e[0].min(bb[i][0]), e[1].min(bb[i][1]), e[2].max(bb[i][2]), e[3].max(bb[i][3])]);
+        let tall = m.iter().map(|&i| bb[i][3] - bb[i][1]).max().unwrap() as f64 / l;
+        let iso = online.iter().filter(|j| !m.contains(j)).map(|&j| m.iter().map(|&i| gap(bb[i][0], bb[i][2], bb[j][0], bb[j][2]).max(gap(bb[i][1], bb[i][3], bb[j][1], bb[j][3]))).min().unwrap()).min();
+        if m.len() > 4 || !m.iter().any(|&i| seed[i]) || iso.is_some_and(|d| (d as f64) < KEEP_REACH_ISO * l)
+            || tall < KEEP_REACH_H.0 || tall > KEEP_REACH_H.1 || ((e[2] - e[0]) as f64) < 0.5 * l {
+            continue;
+        }
+        if let Some((page, slot)) = log {
+            eprintln!("reached\t{page}\t{slot}\t{}\t{}\t{}\t{}\t{}\t{tall:.2}", e[0], e[1], e[2], e[3], m.len());
+        }
+        added = Some(added.map_or(e, |f| [f[0].min(e[0]), f[1].min(e[1]), f[2].max(e[2]), f[3].max(e[3])]));
+        for y in 0..rh {
+            for x in 0..rw {
+                let (mx, my) = (x as i64 - r as i64, y as i64 - r as i64);
+                if rb[y * rw + x] && m.contains(&(lab[y * rw + x] as usize)) && mx >= 0 && my >= 0 && (mx as usize) < mw && (my as usize) < mh {
+                    bits[my as usize * mw + mx as usize] = true;
+                }
+            }
+        }
+    }
+    added
 }
 
 /// --crop (#55): packed 1-bit ink boxes with their text-block anchor -> one canvas; every anchor lands on the
@@ -1845,7 +2007,7 @@ mod tests {
         let (mut bits, w, h, a) = text_page();
         letter(&mut bits, w, 340, 640); // 140 px below the block, in its columns
         letter(&mut bits, w, 340, 786); // on the cut bottom edge
-        let (k, _) = keep_box(&mut bits, w, h, a, &|_, y| y >= h - 3, 4.0, None);
+        let (k, _, _) = keep_box(&mut bits, w, h, a, &|_, y| y >= h - 3, 4.0, None);
         assert!(bits[645 * w + 345] && bits[790 * w + 345]);
         assert!(k[3] >= 800);
     }
@@ -1858,7 +2020,7 @@ mod tests {
             bits[y * w + 2] = true;
             bits[y * w + 3] = true;
         }
-        let (k, _) = keep_box(&mut bits, w, h, a, &|x, _| x < 3, 4.0, None);
+        let (k, _, _) = keep_box(&mut bits, w, h, a, &|x, _| x < 3, 4.0, None);
         assert!(!bits[400 * w + 2] && k[0] > 100);
     }
 
@@ -1885,7 +2047,7 @@ mod tests {
     fn keep_box_head_number_not_dotted_rule() {
         let (mut bits, w, h, a) = text_page();
         letter(&mut bits, w, 20, 100); // on the first line, 180 px out
-        let (k, _) = keep_box(&mut bits, w, h, a, &|_, _| false, 4.0, None);
+        let (k, _, _) = keep_box(&mut bits, w, h, a, &|_, _| false, 4.0, None);
         assert!(bits[105 * w + 25] && k[0] <= 20);
         let (mut bits, w, h, a) = text_page();
         for y in (100..700).step_by(30) {
@@ -1893,6 +2055,58 @@ mod tests {
         }
         keep_box(&mut bits, w, h, a, &|_, _| false, 4.0, None);
         assert!(!bits[105 * w + 25]);
+    }
+
+    // #84: a page number the slot's top cut clipped is completed from the ring; a clipped running head (a row of letters) is not.
+    #[test]
+    fn reach_completes_page_number_not_head() {
+        // main canvas 600x800 holds a 560x760 slot at (20, 20), no skew; ring r = 10
+        let (sw, sh, r) = (560usize, 760usize, 10usize);
+        let run = |ring: &dyn Fn(&mut [bool], usize)| {
+            let (mut bits, w, h, a) = text_page();
+            let mut rb = vec![false; (w + 2 * r) * (h + 2 * r)];
+            for y in 0..h {
+                for x in 0..w {
+                    rb[(y + r) * (w + 2 * r) + x + r] = bits[y * w + x];
+                }
+            }
+            ring(&mut rb, w + 2 * r);
+            for y in 0..h {
+                for x in 0..w {
+                    // the main canvas only sees the slot
+                    bits[y * w + x] = rb[(y + r) * (w + 2 * r) + x + r] && (20..580).contains(&x) && (20..780).contains(&y);
+                }
+            }
+            let near = |_: usize, y: usize| y < 22;
+            let (_, _, kept) = keep_box(&mut bits, w, h, a, &near, 4.0, None);
+            let e = reach(&rb, w + 2 * r, h + 2 * r, r, sw, sh, (300.0, 400.0), (280.0, 400.0 - 20.0), (0.0, 1.0), [false, true, false, false],
+                [false, true, false, false], a, kept, &mut bits, w, h, None);
+            (bits, w, e)
+        };
+        // two digits 20 px tall (1.4 letters) at y 14..34 in main coords: the top 6 rows lie above the slot
+        let digits = |rb: &mut [bool], rw: usize| {
+            for x0 in [470usize, 482] {
+                for y in 14..34 {
+                    for x in x0..x0 + 10 {
+                        rb[(y + r) * rw + x + r] = true;
+                    }
+                }
+            }
+        };
+        let (bits, w, e) = run(&digits);
+        assert!(e.is_some() && bits[15 * w + 475] && bits[15 * w + 487]);
+        // a clipped head: eight 14 px letters, 6 px apart, same place
+        let head = |rb: &mut [bool], rw: usize| {
+            for k in 0..8 {
+                for y in 14..28 {
+                    for x in 300 + k * 16..310 + k * 16 {
+                        rb[(y + r) * rw + x + r] = true;
+                    }
+                }
+            }
+        };
+        let (bits, w, e) = run(&head);
+        assert!(e.is_none() && !bits[15 * w + 305]);
     }
 
     // After compose, ink that filled two differently wide slots edge to edge has the same margin on both sides.
