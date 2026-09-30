@@ -1122,7 +1122,7 @@ is unchanged from v9. f6 p2 gets one 1 px, 15 px tall tick beside the page numbe
 top of the cover is dropped (a big piece at a cut side, as in v9).
 
 **Still open:** f1 p18 "29" and p24 "35" are cut off already in the plan box, before `keep_box` sees the slot; main clips them the
-same way. Measured in #62, see the next section (no fix yet).
+same way. Measured in #62; fixed by #84 (keep_box reach, two sections below). Clipped running heads: #87; skewed p1: #88.
 
 ### Page numbers beyond the near window: measured, no plan-box fix (#62)
 
