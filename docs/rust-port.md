@@ -1121,8 +1121,31 @@ head, label, title of the list in #60 present; no edge rule or blob that main la
 is unchanged from v9. f6 p2 gets one 1 px, 15 px tall tick beside the page number. f5 p1: the masthead strip cut off at the
 top of the cover is dropped (a big piece at a cut side, as in v9).
 
-**Still open:** f1 p18 "29" and p24 "35" are cut off (p18 at the right edge, p24 at the bottom) already in the plan box, before
-`keep_box` sees the slot; main clips them the same way. Widening the crop/split plan box is a separate change.
+**Still open:** f1 p18 "29" and p24 "35" are cut off already in the plan box, before `keep_box` sees the slot; main clips them the
+same way. Measured in #62, see the next section (no fix yet).
+
+### Page numbers beyond the near window: measured, no plan-box fix (#62)
+
+**Cause: the near window in `axis_box` (pass A), not the median box.** Every f1 spread is a double page with a trusted gutter, so
+all pages take `Plan::Split` with their own `trim`; the median single-page box is never used. f1 p18 "29" is the right half of
+source spread 9, digits at x 4123-4163 (analysis image 4299 px wide); p24 "35" is the right half of spread 12, digits at x 4120-4159
+and y 131-158 (top right, not the bottom). The last text run ends at x 3760/3761; `CROP_NEAR_FRAC` 0.08 x 4299 = 344 px stops the
+near reach at 4104/4105, 19 px before the digits start, and `CROP_PAD_FRAC` makes the trim x1 4155/4156. Beyond the text there is a
+constant dark band (about 34 ink px per column), so "extend while contiguous" would run into the table edge. The p24 trim y0 is 157,
+below the top of the digits (131), so the same box also clips numbers at the top (p24, p50).
+
+| variant | result vs v10 (main cf47fc5) |
+|---|---|
+| `CROP_NEAR_FRAC` 0.08 -> 0.10 | f1 page 583 -> 611 pt wide, >2 mm pages 4 -> 5; f5 max \|L-R\| 0.4 -> 16.3 mm; `real.sh` FAIL (skewed) |
+| 2 % slack on `m.trim`, all sides | f1 1 edge band, >2 mm pages 4 -> 11, page 624x765 pt; `real.sh` FAIL on 3 files |
+| 1 % slack, x only | p18 "29" and p24 "35" complete, `verify: ok`; f1 >2 mm pages 4 -> 7, std y0 0.9 -> 1.2, page 594 pt wide; smear on f1 p20 |
+| same, slack never reaches the page edge | `verify: ok`; f1 as above (7 pages, std y0 1.1); f2 std y0 11.8 -> 2.3; p20 smear stays; checker on all files: also stripes/blobs on Korsgaard p2/3/4/6/8, Tosprogede p4/p10, Davidsen p4, Jeppe p2, Juellund p5; p24 top and p50 still clipped (y0) |
+
+No page number was lost against main in any variant (checker, all files). The failure is structural: a number about 140 px beyond
+the text widens and shifts the slot box on the pages that have one, and the wider box lets table edge and shadow in. "Include far-out
+numbers" and "suite not worse than v10" do not both hold with a plan-box change alone. Not verified: variants 1-3 on all files by
+eye (only variant 4 was looked at on every page); the vertical (y0) clip was found late and not tried. Next: #84 (let `keep_box`
+reach further out instead of widening the plan box).
 
 ### Covers: the edge rule is off when many pieces touch a cut (#66)
 
