@@ -52,6 +52,7 @@ const GUTTER_EDGE_SHAVE: f64 = 0.03;
 const GUTTER_MIN_INK_ROWS: u32 = 2;
 const GUTTER_TRUST_FRAC: f64 = 0.08;
 const GUTTER_VALLEY_RATIO: f64 = 0.5;
+const SPLIT_SLIVER_FRAC: f64 = 0.5; // #88: a half the spread box reaches less than this share of the other half gets its own box (skewed p1 0.25, f7 p1 0.31; next 0.61)
 const GRID_ROWS: usize = 48;
 // Dark edge artefact (#53): after closing pinholes, a connected piece this tall (fraction of the slot height) and this
 // narrow, in the outer zone (fraction of the width). Text never makes a component that tall.
@@ -312,6 +313,7 @@ fn measure(page: &Page, i: usize, cfg: &Cfg) -> Meta {
     let kk = k as i64;
     let mut m = Meta { rot, angle, w, cand: w as f64 / h as f64 >= DOUBLE_AR_MIN, ..Default::default() };
     let mut bx = (0, flat.w);
+    let (fw, fh) = (flat.w, flat.h);
     if cfg.crop || cfg.split != Split::Off {
         let [x0, y0, x1, y1] = content_box(&ink, flat.w, flat.h, true);
         m.trim = Some([x0 as i64 * kk, y0 as i64 * kk, (x1 as i64 * kk).min(w), (y1 as i64 * kk).min(h)]);
@@ -330,6 +332,25 @@ fn measure(page: &Page, i: usize, cfg: &Cfg) -> Meta {
             }
             Split::Off => None,
         };
+        // #88: the spread box follows the fuller page, so a sparse facing page (skewed p1: a chapter end, 4 lines and "34")
+        // is cut to a sliver of line ends. That half's own box, on its ink alone, widens the trim's outer x.
+        // ponytail: x only, y stays the spread's (skewed p1's "34" fits); widen y too if a sliver page's lines fall outside it.
+        // SPLIT_SLIVER_FRAC is a rule of thumb from two cases, like KEEP_EDGE_MAX.
+        if let (Some((gx, _)), Some(t)) = (m.gutter, m.trim.as_mut()) {
+            let (l, r) = (gx - t[0], t[2] - gx);
+            let ga = (gx / kk) as usize;
+            let half = |a: usize, b: usize| {
+                let v: Vec<bool> = (0..fh).flat_map(|y| ink[y * fw + a..y * fw + b].iter().copied()).collect();
+                let [x0, _, x1, _] = content_box(&v, b - a, fh, true);
+                ((a + x0) as i64 * kk, ((a + x1) as i64 * kk).min(w))
+            };
+            if l > 0 && ga > 0 && (l as f64) < SPLIT_SLIVER_FRAC * r as f64 {
+                t[0] = t[0].min(half(0, ga).0);
+            }
+            if r > 0 && ga < fw && (r as f64) < SPLIT_SLIVER_FRAC * l as f64 {
+                t[2] = t[2].max(half(ga, fw).1);
+            }
+        }
     }
     if cfg.timing {
         eprintln!("A page {}: get+osd {} ms, analysis {} ms; rot {} angle {:.2} box {:?} double {} gutter {:?}",
