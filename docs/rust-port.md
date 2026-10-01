@@ -1027,7 +1027,7 @@ component that tall. The slot size is unchanged (whitening, not cropping, so all
 Question: in what order and in how many passes should rotate → crop → split → deskew → align → crop run, so that the dark
 edge between the cut and the text goes away and the text sits at the same place on every page? **Status: the order is
 decided and **the default with `--crop`** (#60, the knob `BITONAL_SLOTBOX` is gone). What to keep is decided per connected
-component (`keep_box`, v10 below).** It meets the goals; the page number cut off before `keep_box` is fixed by `reach` (#84); the open defect is the plan box's vertical clip of heads, headings and first/last body lines (#91).
+component (`keep_box`, v10 below).** It meets the goals; the page number cut off before `keep_box` is fixed by `reach` (#84); the plan box's vertical clip of heads, headings and first/last body lines is fixed by the text test in the band rule (#91; known limits there).
 
 Measured by `runner` (numbers) and looked at by `checker` (pages), all four flags, f1–f7 and `tests/real/`. The scripts
 are in the session scratchpad, not committed: `suite.sh` = run + `tests/measure.sh` + `tests/edge-bands.py`, plus a
@@ -1205,7 +1205,52 @@ lost). std y0 (permille): f1 0.8 -> 0.7, f3 15.5 -> 15.5, f5 0.7 -> 0.7, f7 12.8
 skewed 7.5/7.3 s -> 7.3/7.3 s (two runs each): not measurable.
 
 `reach` now hides the plan box's vertical clip: the 18 body lines and 4 headings are text pass A (near window/pad) cut and `reach`
-brought back from the ring. That count is the metric of the plan-box issue (#91); goal: towards 0.
+brought back from the ring. That count was the metric of the plan-box issue; #91 brought it to 0 (below).
+
+### #91: text runs the band rule keeps
+
+Cause (measured): not the near window or the pad, but the band rule in `axis_box` on `content_box`'s row axis in pass A. Row runs
+split at a white gap > `CROP_RUN_GAP`, so every text line near the top or bottom is its own run. A first run ending inside the top
+`CROP_BAND_FRAC` (10 %), or a last run starting inside the bottom 10 %, is taken for a dark scan band: `lo_lim`/`hi_lim` is set and
+the run dropped, so the box starts at the next run (f3 p3 rows 88-108, a body line). `reach` then brought the line back (#87), the
+box itself still cut it. Of 110 dropped first/last runs (f1-f7 + `tests/real`, looked at all) about 58 are text. The row density
+profile cannot tell them from bands (text 0.03-0.18, bands 0.03-0.51); the ink texture can: the share of ink in horizontal
+segments of >= 3.8 mm (`longshare`) is 0.00-0.09 for text lines (0.23-0.40 with a thin rule under them), >= 0.29 for real bands.
+
+Rule (`content_box(.., band = true)`, row axis only): the band rule keeps the run instead of dropping it when (1) it does not start
+in the edge zone (top: `start > e0`, bottom: `end < n-1-e0`; there it is merged with the scan edge), (2) it is at most
+`BAND_TEXT_MAX_H_MM` = 5.9 mm tall (a dithered picture or a masthead reads as text otherwise) and (3) at most `BAND_TEXT_LONG`
+= 0.15 of its ink lies in segments of `BAND_TEXT_SEG_MM` = 3.8 mm or more. The lengths are mm, converted with the analysis dpi
+(`content_box` takes `px_per_mm`; 45 and 70 px at 300 dpi). The kept run stays in `runs`; the clamp moves to its own edge,
+`lo_lim = max(lo_lim, start - pad)` / `hi_lim = min(hi_lim, end + pad)`, `pad = CROP_PAD_FRAC * n`. The clamp stays on purpose
+(without it the near window runs into the dark edge band: y0 8 on f1, f3, f4, f7); a margin of only `CROP_RUN_GAP * n` cut
+ascender tips. Otherwise nothing changes. Unit test `band_rule_keeps_text_line_drops_bar`.
+
+Result (13 files, four flags, `diag87/run.sh`, main 5c670ce as base; every number as predicted in the design, no constant tuned):
+39 runs kept over 12 files, all text. Pass-A boxes change on f1 [4, 8, 24, 25], f2 [6, 10], f3 [2-9], f5 [3, 5], f7 [3, 4, 5, 7, 9],
+flerspaltet [1, 2], ren-side [1], ren pdf [1, 3, 4, 5], sidste [1, 2, 4], skewed [17, 18, 22]; f4, f6, ryg-side identical.
+`line` log: body 18 -> 0, heading 4 -> 0, `cut` 2 -> 0, headfoot 13 -> 1 (f1 p12 slot 2, x 1103-1771, y 81-111). `reached` rows
+on f1 6 -> 5 (p24 "35" is now inside the plan box). G4 pages changed: f1 [7, 8, 15, 16, 47-50], f3 [2-13, 15-17], f7 [5-10, 13, 14,
+17, 18], skewed [33-36, 44], flerspaltet [5] (no ink change, median shift), ren-side [1]; f2, f4, f6, ryg-side bit-identical. f5 and
+sidste change on every page, only because the canvas changes.
+
+Canvas (mm): f5 +5.9 h (p3, p5 keep the grey box / heading strip above the first body line), ren-side +15.4 h (running head
+"PRISMET AKTUELT" and the ISSN footer were clipped), sidste -2.0 w / +0.3 h; f1 f2 f3 f4 f6 f7 flerspaltet ryg-side skewed 0. std y0
+(permille): f3 15.5 -> 15.4, f5 0.7 -> 0.0, f7 12.7 -> 6.6, skewed 1.5 -> 1.2, sidste 68.2 -> 32.1, rest equal. Foot flags
+(`measure.sh`): lost 0, gained f7 p5, p7, p18. `tests/verify.sh` ok; `real.sh` facts moved only in page size (ren-side, sidste) and
+were re-recorded after looking at the output.
+
+Added ink (`adiff.py` with MINADD=1, then `checker` over the crops at 150 dpi): every top/bottom addition is a text line, running
+head, heading or page number (f1 p8 "Hvad er religionskritik?", f3 p13, f7 p5/p17/p18 "KAPITEL 10", ren-side head and "[427]",
+sidste p7/p8, skewed p44); f5 p3 keeps the top of a grey "Laes mere om fagfornyelsen" box, f5 p1 a title strip. **Not text:** thin
+1 px vertical lines (a rule or scan edge, 40-290 px tall at 150 dpi) now reach further up on f1 p7 (beside "18"), f7 p5, f7 p7 and
+f7 p17. They are collateral of the taller box, not something the rule selects; reported, not fixed here.
+
+Not fixed (known limits, the rule is not widened): f2 heads (p3 "148", p6, p10, p16): pass A's box includes them now, but
+`Plan::Box` uses the median single-page box, so they stay out (a per-page box for non-split pages is a separate change). f4 p1/p3/p4
+heads (black number tab and a rule, texture 0.29-0.37, same as f3 p1's cover bottom 0.29), f4 p2/p5 and sidste p6 (the run starts
+in the edge zone) stay clipped as in main. f2 p2 (dithered figure) and f2 p1 (masthead) fail the height/texture test by design. f1
+p4 slot 2 "19" lies beyond the near window in x. `reach()` stays and still hides any residual clip.
 
 ### A sparse facing page: its own half box (#88)
 

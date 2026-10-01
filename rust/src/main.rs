@@ -70,6 +70,10 @@ const CROP_NEAR_FRAC: f64 = 0.08;
 const CROP_BAND_FRAC: f64 = 0.10;
 const CROP_EDGE_FRAC: f64 = 0.015;
 const CROP_PAD_FRAC: f64 = 0.012;
+// #91: a first/last run the band rule would drop is kept when it reads as text: not tall, and little of its ink in long horizontal segments.
+const BAND_TEXT_LONG: f64 = 0.15; // #91: max share of ink in long segments (text 0.00-0.09, real bands >= 0.29)
+const BAND_TEXT_SEG_MM: f64 = 3.8; // #91: min length of a "long" horizontal ink segment
+const BAND_TEXT_MAX_H_MM: f64 = 5.9; // #91: max height of the kept run
 const KEEP_FRAME_FILL: f64 = 0.1; // keep_box: a piece with less ink than this share of its box is a frame/edge candidate
 const KEEP_ZONE_D: f64 = 12.0; // keep_box: sideways reach on the header/footer line, in letter heights
 const KEEP_HEAD_D: f64 = 24.0; // keep_box: sideways reach on the block's top/bottom kept line, in letter heights (f1 p3: 18)
@@ -321,7 +325,7 @@ fn measure(page: &Page, i: usize, cfg: &Cfg) -> Meta {
     let mut bx = (0, flat.w);
     let (fw, fh) = (flat.w, flat.h);
     if cfg.crop || cfg.split != Split::Off {
-        let [x0, y0, x1, y1] = content_box(&ink, flat.w, flat.h, true);
+        let [x0, y0, x1, y1] = content_box(&ink, flat.w, flat.h, true, (cfg.dpi / k as f32) as f64 / 25.4);
         m.trim = Some([x0 as i64 * kk, y0 as i64 * kk, (x1 as i64 * kk).min(w), (y1 as i64 * kk).min(h)]);
         bx = (x0, x1);
     }
@@ -347,7 +351,7 @@ fn measure(page: &Page, i: usize, cfg: &Cfg) -> Meta {
             let ga = (gx / kk) as usize;
             let half = |a: usize, b: usize| {
                 let v: Vec<bool> = (0..fh).flat_map(|y| ink[y * fw + a..y * fw + b].iter().copied()).collect();
-                let [x0, _, x1, _] = content_box(&v, b - a, fh, true);
+                let [x0, _, x1, _] = content_box(&v, b - a, fh, true, (cfg.dpi / k as f32) as f64 / 25.4);
                 ((a + x0) as i64 * kk, ((a + x1) as i64 * kk).min(w))
             };
             if l > 0 && ga > 0 && (l as f64) < SPLIT_SLIVER_FRAC * r as f64 {
@@ -477,7 +481,7 @@ fn finish(page: &Page, i: usize, m: &Meta, plan: Plan, (tw, th): (i64, i64), cfg
                 // What to keep, per component (section 8): the text block, and whatever lies near it; not what
                 // touches the slot's border or is a thin tall rule, unless it reaches the block's core (a full-bleed
                 // picture). Kept ink is cropped, centred and top-aligned by compose.
-                let a = content_box(&bits, c.w, c.h, false);
+                let a = content_box(&bits, c.w, c.h, false, 0.0);
                 let (sn, cs) = angle.to_radians().sin_cos();
                 let (ox, oy) = ((c.w as i64 - s.w as i64) / 2, (c.h as i64 - s.h as i64) / 2);
                 let (gcx, gcy) = (s.w as f32 / 2.0, s.h as f32 / 2.0);
@@ -503,7 +507,7 @@ fn finish(page: &Page, i: usize, m: &Meta, plan: Plan, (tw, th): (i64, i64), cfg
                     let rc = flatten(&rotate(&crop(&r, b), angle, cw, ch, 1.0), COVER_BLUR_SIGMA);
                     bits = hyst(&rc, cfg.thresh);
                     clear_edge_bands(&mut bits, rc.w, rc.h);
-                    let a = content_box(&bits, rc.w, rc.h, false);
+                    let a = content_box(&bits, rc.w, rc.h, false, 0.0);
                     [x0, y0, x1, y1] = keep_box(&mut bits, rc.w, rc.h, a, &near_edge, cfg.keep_d, log).0;
                 }
                 if !cover && cut.contains(&true) {
@@ -1271,9 +1275,32 @@ fn q8(v: f64) -> f64 {
 
 /// Text-block bounds [x0, y0, x1, y1) of an ink map: rows first, then columns inside the row range
 /// (port of bitonalpdf.sh content_box, see docs/lessons.md 1, 4, 6, 6b).
-fn content_box(ink: &[bool], w: usize, h: usize, band: bool) -> [usize; 4] {
+fn content_box(ink: &[bool], w: usize, h: usize, band: bool, px_per_mm: f64) -> [usize; 4] {
     let rows: Vec<f64> = (0..h).map(|y| q8(ink[y * w..(y + 1) * w].iter().filter(|&&b| b).count() as f64 / w as f64)).collect();
-    let (y0, ht) = axis_box(&rows, band);
+    let (max_h, seg) = ((BAND_TEXT_MAX_H_MM * px_per_mm).round() as i64, (BAND_TEXT_SEG_MM * px_per_mm).round() as usize);
+    // #91: rows s0..=e1 look like text: short, and little of the ink in long horizontal segments
+    let text = |s0: i64, e1: i64| {
+        if e1 - s0 + 1 > max_h {
+            return false;
+        }
+        let (mut ink_px, mut long_px) = (0usize, 0usize);
+        for y in s0 as usize..=e1 as usize {
+            let mut run = 0;
+            for x in 0..=w {
+                if x < w && ink[y * w + x] {
+                    run += 1;
+                    ink_px += 1;
+                } else if run > 0 {
+                    if run >= seg {
+                        long_px += run;
+                    }
+                    run = 0;
+                }
+            }
+        }
+        ink_px > 0 && (long_px as f64) <= BAND_TEXT_LONG * ink_px as f64
+    };
+    let (y0, ht) = axis_box(&rows, band, &text);
     let sc = ht as f64 / h as f64;
     let mut cnt = vec![0usize; w];
     for y in y0..y0 + ht {
@@ -1282,12 +1309,12 @@ fn content_box(ink: &[bool], w: usize, h: usize, band: bool) -> [usize; 4] {
         }
     }
     let cols: Vec<f64> = cnt.iter().map(|&c| q8(c as f64 / ht as f64) * sc).collect();
-    let (x0, wd) = axis_box(&cols, band);
+    let (x0, wd) = axis_box(&cols, band, &|_, _| false);
     [x0, y0, x0 + wd, y0 + ht]
 }
 
 /// One axis of content_box: (first, length). Literal port of the awk, including its integer truncations.
-fn axis_box(dens: &[f64], band_rule: bool) -> (usize, usize) {
+fn axis_box(dens: &[f64], band_rule: bool, text: &dyn Fn(i64, i64) -> bool) -> (usize, usize) {
     let n = dens.len() as i64;
     let nf = n as f64;
     let ok = |i: i64, lo: f64| i >= 0 && i < n && dens[i as usize] >= lo && dens[i as usize] <= CROP_MAX_DENSITY;
@@ -1317,11 +1344,21 @@ fn axis_box(dens: &[f64], band_rule: bool) -> (usize, usize) {
     let band = (CROP_BAND_FRAC * nf) as i64;
     let (mut lo_lim, mut hi_lim) = (e0, n - 1 - e0);
     if band_rule && runs.len() >= 2 && runs[0].1 <= band {
-        lo_lim = runs[0].1 + 1;
-        runs.remove(0);
+        if runs[0].0 > e0 && text(runs[0].0, runs[0].1) {
+            lo_lim = lo_lim.max(runs[0].0 - (CROP_PAD_FRAC * nf) as i64);
+        } else {
+            lo_lim = runs[0].1 + 1;
+            runs.remove(0);
+        }
     }
     if band_rule && runs.len() >= 2 && runs.last().unwrap().0 >= n - 1 - band {
-        hi_lim = runs.pop().unwrap().0 - 1;
+        let r = *runs.last().unwrap();
+        if r.1 < n - 1 - e0 && text(r.0, r.1) {
+            hi_lim = hi_lim.min(r.1 + (CROP_PAD_FRAC * nf) as i64);
+        } else {
+            hi_lim = r.0 - 1;
+            runs.pop();
+        }
     }
     let block = if runs.is_empty() { all } else { Some((runs[0].0, runs.last().unwrap().1)) };
     let (mut first, mut last) = match block {
@@ -2087,10 +2124,30 @@ mod tests {
                     || (y >= 1180 && y < 1200 && x >= 490 && x < 510) // page number
             })
             .collect();
-        let [x0, y0, x1, y1] = content_box(&ink, w, h, true);
+        let [x0, y0, x1, y1] = content_box(&ink, w, h, true, 300.0 / 25.4);
         assert!(y0 > 100 && y0 < 200, "{y0}");
         assert!(y1 > 1200, "{y1}");
         assert!(x0 < 150 && x1 > 850);
+    }
+
+    // #91: a text line near the top is kept by the band rule, a dark bar there is still dropped
+    #[test]
+    fn band_rule_keeps_text_line_drops_bar() {
+        let (w, h) = (1000usize, 1400usize);
+        let page = |top: &dyn Fn(usize, usize) -> bool| -> usize {
+            let ink: Vec<bool> = (0..w * h)
+                .map(|i| {
+                    let (x, y) = (i % w, i / w);
+                    top(x, y) || (y >= 300 && y < 1100 && x >= 150 && x < 850 && (x + y) % 5 == 0)
+                })
+                .collect();
+            content_box(&ink, w, h, true, 300.0 / 25.4)[1]
+        };
+        // 20 px line of 10 px letters with 6 px gaps, at 3 % from the top
+        let line = page(&|x, y| y >= 42 && y < 62 && x >= 150 && x < 850 && x % 16 < 10);
+        let bar = page(&|x, y| y >= 42 && y < 62 && x >= 150 && x < 850);
+        assert!(line < 42, "{line}");
+        assert!(bar > 200, "{bar}");
     }
 
     // keep_box (#55, #60) on a synthetic page: 10x14 letters in 13 lines make the text block. Returns the bits and its box.
@@ -2106,7 +2163,7 @@ mod tests {
                 }
             }
         }
-        let a = content_box(&bits, w, h, false);
+        let a = content_box(&bits, w, h, false, 0.0);
         (bits, w, h, a)
     }
 
