@@ -1380,7 +1380,7 @@ on main at 7c0bb12, one throwaway `eprintln!` where the cover branch is taken. 1
 (JPEG 2000 panic, #97, not run); no timeouts, slowest file 51 s. 40 files wrote no output (4 crashes, 36 not smaller).
 
 **Fired:** 16 pages in 11 files, each looked at (100 dpi, source vs output). Like f5 p1: **1** (v096 p1, white text on dark
-circles + photo). Other: 15 (hand-drawn sheet music 6, photo or drawing pages 3, book pages with a dark table or edge band 5,
+circles + photo). Other: 15 (sheet music and forms 6, photo or drawing pages 3, book pages with a dark table or edge band 5,
 dark book board without text 1).
 
 **Candidate misses** (page-level search at 30 dpi: a dark piece ≥ 3 % of the page, not touching the border, with ≥ 3 light holes
