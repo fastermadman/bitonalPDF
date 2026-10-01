@@ -1373,6 +1373,25 @@ changed (f5 p1 has no page number).
 - `BITONAL_WHITENED=1` lists both `keep_box` passes for a cover slot.
 - The text/fill colours in the source were not measured (luma only).
 
+### Survey: the cover rule on 201 real scans (#96)
+Held-out set, local only (the owner's RAW scans; ids v001–v201, never committed): 201 PDFs, 4 669 pages, 618 147 024 B; by page 1,
+96 scans without fonts, 52 with an OCR layer (≥ 150 ppi), 9 unclear, 44 born-digital. Run: `--rotate --crop --split auto --deskew`
+on main at 7c0bb12, one throwaway `eprintln!` where the cover branch is taken. 192 files exit 0, 5 exit 2 (unsplit pages), 4 exit 101
+(JPEG 2000 panic, #97, not run); no timeouts, slowest file 51 s. 40 files wrote no output (4 crashes, 36 not smaller).
+
+**Fired:** 16 pages in 11 files, each looked at (100 dpi, source vs output). Like f5 p1: **1** (v096 p1, white text on dark
+circles + photo). Other: 15 (hand-drawn sheet music 6, photo or drawing pages 3, book pages with a dark table or edge band 5,
+dark book board without text 1).
+
+**Candidate misses** (page-level search at 30 dpi: a dark piece ≥ 3 % of the page, not touching the border, with ≥ 3 light holes
+of 0.5–50 % of its area; 49 pages, all looked at): clear look-alikes **3** (v073 p1, v027 p1, v136 p1) and 1 borderline (v020 p1);
+all four come out badly (title kept, rest of the text on the fill lost or the cover split in two). One more borderline (v018 p3)
+comes out readable. The other 44 are illustrations without text, text pages with photos, scans with a dark table, emblems.
+
+**Verdict:** the rule fires on 1 f5-like page of 16 hits; 4 pages in 4 files (v096, v073, v027, v136) are f5-like, plus 1 borderline.
+#79 has a use and a local hold-out set. Limits: the search is a heuristic and can miss pages; outputs of v053 and v002 hits not
+seen (split / no output file); 4 crashed files were searched but not rendered.
+
 ## 9. B4c: colour policy with information over size (#74)
 
 Question: what keeps colour or grey, and who decides (user, automatic, automatic with a printed suggestion), now that
