@@ -438,6 +438,25 @@ What did not work (all at gate 0.25 or raw, same 188 + 308 cases):
 - **Raising the gate** alone: 0 upright turned needs 0.45, which costs the old suite 9 cases (177/188).
 - **A whole-document vote** was not tried: f7 had 8 of 9 pages wrong the same way, so a vote would have followed the error.
 
+### Low-confidence pages follow the document (#52)
+A page under the 0.25 gate used to stay at 0°. Now `main` takes the majority quarter turn of the confident pages of the
+input file; the pages under the gate are measured again with that turn (only those). A confident page is never overridden.
+Assumptions: "document" = the input pages, before any split (a spread is one page); no confident page, or a tie for first place → 0°.
+`--osd-eval` prints a `final` column (the vote, per whole-document turn 0/90/180/270 = a whole-document rotated copy).
+
+| (same cases as above; `EVAL_UPRIGHT=1` on f1–f7, old suite as before) | gate only | with vote |
+|---|---:|---:|
+| f1–f7, 308 cases, right | 227 | **277** |
+| f1–f7, upright pages turned (of 77) | 0 | **0** |
+| old suite, 188 cases, right | 186 | **188** |
+| old suite, upright pages turned (of 47) | 0 | **0** |
+
+Per file (right of cases, gate → vote): f1 87→100/100, f2 57→71/72, f3 33→36/36, f4 20→20/20, f5 16→28/28, f6 4→4/16, f7 10→18/36.
+f6 and f7 stay low: no (f6) or too few right (f7) confident pages to vote with. Real run: a copy of the Juellund file with every
+page turned 90° (`qpdf --rotate=+90`): main writes landscape pages (841.68 x 595.2), now portrait (595.2 x 841.68); the 180° copy and
+the upright file come out portrait both before and after. `tests/verify.sh` with `BASE_BIN` = build of main: ok, all 13 real files
+byte-identical to main (no page there is under the gate with a non-zero majority).
+
 ## 4. B4 groundwork: material, baseline, codecs, signals (#43)
 
 Measurements for #38 (mixed output). **Data only: no thresholds, no rules, no design.** The seven PDFs are not open source
