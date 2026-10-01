@@ -1027,7 +1027,7 @@ component that tall. The slot size is unchanged (whitening, not cropping, so all
 Question: in what order and in how many passes should rotate → crop → split → deskew → align → crop run, so that the dark
 edge between the cut and the text goes away and the text sits at the same place on every page? **Status: the order is
 decided and **the default with `--crop`** (#60, the knob `BITONAL_SLOTBOX` is gone). What to keep is decided per connected
-component (`keep_box`, v10 below).** It meets the goals; the one open defect is a page number cut off before `keep_box` (see the end).
+component (`keep_box`, v10 below).** It meets the goals; the page number cut off before `keep_box` is fixed by `reach` (#84); the open defect is the plan box's vertical clip of heads, headings and first/last body lines (#91).
 
 Measured by `runner` (numbers) and looked at by `checker` (pages), all four flags, f1–f7 and `tests/real/`. The scripts
 are in the session scratchpad, not committed: `suite.sh` = run + `tests/measure.sh` + `tests/edge-bands.py`, plus a
@@ -1172,6 +1172,40 @@ y0 0.24 -> 0.21 mm (without the six pages: equal to main). p18's measure.sh y1/f
 bottom rule after a 4 px sideways shift, not new ink. Cost: the ring build is 0-29 % wall time (f1 4.9 -> 5.8 s).
 Limits: a number with no digit reaching into the slot is not found; a lone "1" fails the width test; the running heads of
 p16, p48 and p50 stay missing (cut off by the plan box in main too).
+
+### Clipped lines: seed + chain (#87)
+
+After the #84 number clusters `reach` restores whole text lines the plan box cut (running heads, footers, headings, first/last
+body lines), from the same ring dump, at no extra ring cost. Rule, constants `KEEP_LINE_*` in `main.rs`:
+1. **Pool:** ring pieces with a pixel outside the slot, not at the grown box's cut, <= 3 letters (l) big. Two are linked when
+   they share rows and stand <= `KEEP_LINE_GAP` = 1.0 l apart sideways.
+2. **Seeds:** `reach`'s candidates anchored in ink main kept. A linked component counts only with a seed.
+3. **Line:** seeded components whose row bands overlap by half the smaller height are one line (f1 p24's clipped ascenders are
+   separate pieces, joined only through letters main kept). Added when >= `KEEP_LINE_MIN` = 3 letter pieces carry >=
+   `KEEP_LINE_INK` = 80 % of its ink.
+4. **Diacritics:** a pool piece <= 0.5 l tall overlapping a kept line piece in x and within 0.5 l vertically joins (i dots, the
+   ring of a; they share no rows with the letter). Without this: "tıng", "ma" for "må".
+5. **Class (logged, not a filter):** `BITONAL_WHITENED=1` prints one `line` row per restored line: page slot x0 y0 x1 y1 class
+   white-rows-in-l `cut`. White rows to the next kept ink towards the block: < 1.25 l body line, 1.25-4 l heading, >= 4 l
+   head/footer. `cut` = a pool-excluded edge piece sits on the line within 1.0 l (it runs past the ring).
+
+Why these numbers: word spaces are 0.52-0.61 l on f1, 0.64 l on f3; a gap of 0.3 or 0.6 left whole words out; 1.0 gives every
+line complete. Per-seed grouping failed (p24 split into 1-2-piece groups), so the guard judges a whole line. Rejected by the
+guard: f1 p43 speckle beside a book-edge curl (47 pieces, letter ink 44 %), picture-page singletons f1 p9/15/25/33 (l = 8-10 px),
+f2 p1/p14, sidste p8's rule (0 letters). A median-letter-height guard separated nothing the letter guard does not (real lines
+0.76-1.80 l, noise 0.71-2.88 l); a dotted-rule guard has no case in the data (known limit).
+
+Result (f1-f7 + `tests/real`, main f3158a0 as base, `checker` over all 33 diff crops at 150 dpi, i dots re-checked at 300 dpi):
+35 lines restored, every one complete and text, none cut except the two logged `cut`: 18 body (f3 p2/4/5/7/9/10/11/12/14/16, f5 p3,
+f7 p6/p9, skewed p33/35/44, sidste p2/p7), 4 heading (f3 p8, f7 p8/p14, sidste p4), 13 head/footer (f1 p16/24/47/48/49/50, f3 p7,
+ren pdf p1-p5, ren-side p1); `cut`: skewed p44 (first word lacks its start), sidste p7. f2, f4, f6, flerspaltet, ryg-side are
+byte-identical. Untouched pages of f1, f3, f5, f7, skewed are bit-identical and their canvas is the same. Canvas grows on ren pdf
+(+3.0 mm w, +1.7 mm h), ren-side (+2.4 mm h) and sidste (+1.7 mm h). Page-number/footer flags: identical on f1, f3, f5, f7 (no number
+lost). std y0 (permille): f1 0.8 -> 0.7, f3 15.5 -> 15.5, f5 0.7 -> 0.7, f7 12.8 -> 12.7. Wall time f1 12.2/12.0 s -> 12.0/11.6 s,
+skewed 7.5/7.3 s -> 7.3/7.3 s (two runs each): not measurable.
+
+`reach` now hides the plan box's vertical clip: the 18 body lines and 4 headings are text pass A (near window/pad) cut and `reach`
+brought back from the ring. That count is the metric of the plan-box issue (#91); goal: towards 0.
 
 ### A sparse facing page: its own half box (#88)
 

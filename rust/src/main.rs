@@ -13,7 +13,8 @@
 //   BITONAL_WHITENED=1      (#63) with --crop, keep_box prints one TSV row per whitened component to stderr ("whitened" page slot
 //                           x0 y0 x1 y1 pixels letters outside reason slot_h); tests/whitened.py filters it. Off: no change.
 //                           (#84) plus one "reached" row per page number added from beyond the slot (page slot x0 y0 x1 y1
-//                           pieces height_in_letters).
+//                           pieces height_in_letters); (#87) one "line" row per clipped text line restored (page slot x0 y0 x1 y1
+//                           class white_rows_in_letters cut), class = body | heading | headfoot.
 //   BITONAL_OSD=tesseract   orientation by Tesseract OSD (as bash) instead of the own detector (#30); --osd-eval prints its accuracy
 //                           (EVAL_UPRIGHT=1: the input pages are upright, no Tesseract truth; #45)
 // --detect-eval a.pdf [b.pdf ...] prints candidate picture/colour signals per page and tile as TSV (#43, docs/rust-port.md section 4).
@@ -77,6 +78,11 @@ const KEEP_RULE_FRAC: f64 = 0.25; // keep_box: a thin piece longer than this sha
 const KEEP_REACH_FRAC: f64 = 0.02; // #84: ring outside a slot's cut sides searched for page numbers; R and TIGHT_RIM use the same measure, max(w, h), so the ring fits in the rim
 const KEEP_REACH_ISO: f64 = 3.0; // #84: a reached page number stands this many letter heights clear of other ring letters (f1 p24's clipped head: 1.2-2.5)
 const KEEP_REACH_H: (f64, f64) = (1.2, 1.8); // #84: its tallest digit, in letter heights (f1 digits 1.33-1.61; head letters <= 1.05, cartoon/margin pieces >= 1.93)
+const KEEP_LINE_GAP: f64 = 1.0; // #87: clipped line pieces link across this sideways gap, in letter heights (word spaces 0.52-0.64; 0.3 and 0.6 dropped words)
+const KEEP_LINE_MIN: usize = 3; // #87: a restored line has at least this many letter pieces ...
+const KEEP_LINE_INK: f64 = 0.8; // #87: ... carrying this share of its ink (f1 p43's speckle: 44 %)
+const KEEP_LINE_DIA: f64 = 0.5; // #87: a diacritic piece is at most this tall and within this distance of the line, in letter heights
+const KEEP_LINE_CLASS: (f64, f64) = (1.25, 4.0); // #87: logged class by white rows to the block: body line < 1.25 l <= heading < 4 l <= head/footer
 const TIGHT_RIM: f32 = 0.03; // --crop: white rim around a slot before its box is measured (> CROP_EDGE_FRAC)
 const BLUR_SIGMA: f32 = 30.0; // px at the output dpi, like bash's -blur 0x30
 const COVER_BLUR_SIGMA: f32 = 1000.0; // px, a cover slot's flatten (#71): wider than f5 p1's circles, so fills stay grey
@@ -809,6 +815,96 @@ fn reach(rb: &[bool], rw: usize, rh: usize, r: usize, sw: usize, sh: usize, (ccx
                 if rb[y * rw + x] && m.contains(&(lab[y * rw + x] as usize)) && mx >= 0 && my >= 0 && (mx as usize) < mw && (my as usize) < mh {
                     bits[my as usize * mw + mx as usize] = true;
                 }
+            }
+        }
+    }
+    // #87: clipped text lines. Pool: ring pieces out of the slot, not at the grown box's cut, at most 3 letters big; two are
+    // linked when they share rows and stand <= KEEP_LINE_GAP letters apart sideways. A linked component counts when it holds a
+    // seed (a candidate anchored in ink main kept); seeded components whose row bands overlap by half the smaller height are one
+    // text line (f1 p24's clipped ascenders join only through letters main kept). A line is added when >= KEEP_LINE_MIN letter
+    // pieces carry >= KEEP_LINE_INK of its ink (not speckle). Then small pieces over/under it (i dots, the ring of a) join.
+    let pool: Vec<usize> = (0..n).filter(|&i| comps[i].0 > 0 && out[i] && !edge[i] && ((bb[i][2] - bb[i][0]).max(bb[i][3] - bb[i][1]) as f64) <= 3.0 * l).collect();
+    let mut grp: Vec<usize> = (0..n).collect();
+    for (x, &p) in pool.iter().enumerate() {
+        for &q in &pool[x + 1..] {
+            let (s, t) = (bb[p], bb[q]);
+            if gap(s[0], s[2], t[0], t[2]) as f64 <= KEEP_LINE_GAP * l && s[3].min(t[3]) > s[1].max(t[1]) {
+                let (rp, rq) = (find(&mut grp, p), find(&mut grp, q));
+                grp[rp] = rq;
+            }
+        }
+    }
+    let seeded: Vec<usize> = cand.iter().copied().filter(|&i| seed[i] && pool.contains(&i)).map(|i| find(&mut grp, i)).collect();
+    let root: Vec<usize> = (0..n).map(|i| find(&mut grp, i)).collect();
+    let mut grp: Vec<usize> = (0..n).map(|i| if pool.contains(&i) && seeded.contains(&root[i]) { root[i] } else { usize::MAX }).collect();
+    let mut band: Vec<(usize, i64, i64)> = vec![]; // (component, top row, bottom row)
+    for &i in pool.iter().filter(|&&i| grp[i] != usize::MAX) {
+        match band.iter_mut().find(|b| b.0 == grp[i]) {
+            Some(b) => { b.1 = b.1.min(bb[i][1]); b.2 = b.2.max(bb[i][3]); }
+            None => band.push((grp[i], bb[i][1], bb[i][3])),
+        }
+    }
+    let mut lp: Vec<usize> = (0..band.len()).collect();
+    for x in 0..band.len() {
+        for y in x + 1..band.len() {
+            let (s, t) = (band[x], band[y]);
+            if (s.2.min(t.2) - s.1.max(t.1)) * 2 >= (s.2 - s.1).min(t.2 - t.1) {
+                let (rx, ry) = (find(&mut lp, x), find(&mut lp, y));
+                lp[rx] = ry;
+            }
+        }
+    }
+    for g in grp.iter_mut() {
+        if let Some(x) = band.iter().position(|b| b.0 == *g) {
+            *g = band[find(&mut lp, x)].0;
+        }
+    }
+    let mut on = vec![false; n];
+    let mut lines: Vec<usize> = pool.iter().map(|&i| grp[i]).filter(|&g| g != usize::MAX).collect();
+    lines.sort();
+    lines.dedup();
+    for line in lines {
+        let m: Vec<usize> = pool.iter().copied().filter(|&i| grp[i] == line).collect();
+        let letters: Vec<usize> = m.iter().copied().filter(|&i| comps[i].0 as f64 >= l * l / 8.0 && (bb[i][3] - bb[i][1]) as f64 >= l / 2.0).collect();
+        let ink = |v: &[usize]| v.iter().map(|&i| comps[i].0 as f64).sum::<f64>();
+        if letters.len() < KEEP_LINE_MIN || ink(&letters) < KEEP_LINE_INK * ink(&m) {
+            continue;
+        }
+        for &i in &m {
+            on[i] = true;
+        }
+        if let Some((page, slot)) = log {
+            // class: white rows between the line and the next kept ink towards the block, after its own kept ink
+            let e = m.iter().fold([i64::MAX, i64::MAX, i64::MIN, i64::MIN], |e, &i| [e[0].min(bb[i][0]), e[1].min(bb[i][1]), e[2].max(bb[i][2]), e[3].max(bb[i][3])]);
+            let down = (e[1] + e[3]) / 2 < (k[1] + k[3]) / 2;
+            let row = |y: i64| y >= 0 && (y as usize) < mh && (0..mw).any(|x| bits[y as usize * mw + x]);
+            let mut y = if down { e[3] } else { e[1] - 1 };
+            while row(y) {
+                y += if down { 1 } else { -1 };
+            }
+            let y0 = y;
+            while y >= 0 && (y as usize) < mh && !row(y) {
+                y += if down { 1 } else { -1 };
+            }
+            let white = (y - y0).abs() as f64 / l;
+            let class = if white < KEEP_LINE_CLASS.0 { "body" } else if white < KEEP_LINE_CLASS.1 { "heading" } else { "headfoot" };
+            // an edge piece on the line within the sideways gap: the line runs past the ring
+            let cut = (0..n).any(|j| comps[j].0 > 0 && out[j] && edge[j] && bb[j][3].min(e[3]) > bb[j][1].max(e[1]) && gap(bb[j][0], bb[j][2], e[0], e[2]) as f64 <= KEEP_LINE_GAP * l);
+            eprintln!("line\t{page}\t{slot}\t{}\t{}\t{}\t{}\t{class}\t{white:.2}\t{}", e[0], e[1], e[2], e[3], if cut { "cut" } else { "" });
+        }
+    }
+    let dia: Vec<usize> = pool.iter().copied().filter(|&p| !on[p] && ((bb[p][3] - bb[p][1]) as f64) <= KEEP_LINE_DIA * l
+        && pool.iter().any(|&q| on[q] && bb[p][0] < bb[q][2] && bb[q][0] < bb[p][2] && gap(bb[p][1], bb[p][3], bb[q][1], bb[q][3]) as f64 <= KEEP_LINE_DIA * l)).collect();
+    for p in dia {
+        on[p] = true;
+    }
+    for y in 0..rh {
+        for x in 0..rw {
+            let (mx, my) = (x as i64 - r as i64, y as i64 - r as i64);
+            if rb[y * rw + x] && on[lab[y * rw + x] as usize] && mx >= 0 && my >= 0 && (mx as usize) < mw && (my as usize) < mh {
+                bits[my as usize * mw + mx as usize] = true;
+                let e = [mx, my, mx + 1, my + 1];
+                added = Some(added.map_or(e, |f| [f[0].min(e[0]), f[1].min(e[1]), f[2].max(e[2]), f[3].max(e[3])]));
             }
         }
     }
@@ -2078,9 +2174,10 @@ mod tests {
         assert!(!bits[105 * w + 25]);
     }
 
-    // #84: a page number the slot's top cut clipped is completed from the ring; a clipped running head (a row of letters) is not.
+    // #84/#87: a page number the slot's top cut clipped is completed from the ring; so is a clipped line beside an anchored
+    // letter (a running head: >= 3 letter pieces); an anchored letter among specks is not.
     #[test]
-    fn reach_completes_page_number_not_head() {
+    fn reach_completes_page_number_and_line_not_specks() {
         // main canvas 600x800 holds a 560x760 slot at (20, 20), no skew; ring r = 10
         let (sw, sh, r) = (560usize, 760usize, 10usize);
         let run = |ring: &dyn Fn(&mut [bool], usize)| {
@@ -2116,7 +2213,7 @@ mod tests {
         };
         let (bits, w, e) = run(&digits);
         assert!(e.is_some() && bits[15 * w + 475] && bits[15 * w + 487]);
-        // a clipped head: eight 14 px letters, 6 px apart, same place
+        // a clipped head: eight 14 px letters, 6 px apart; the part in the slot is kept, the 6 rows above it come back
         let head = |rb: &mut [bool], rw: usize| {
             for k in 0..8 {
                 for y in 14..28 {
@@ -2127,7 +2224,24 @@ mod tests {
             }
         };
         let (bits, w, e) = run(&head);
-        assert!(e.is_none() && !bits[15 * w + 305]);
+        assert!(e.is_some() && bits[15 * w + 305] && bits[15 * w + 305 + 7 * 16]);
+        // the same first letter among six 3 px specks: one letter piece, no line
+        let specks = |rb: &mut [bool], rw: usize| {
+            for y in 14..28 {
+                for x in 300..310 {
+                    rb[(y + r) * rw + x + r] = true;
+                }
+            }
+            for k in 1..7 {
+                for y in 14..17 {
+                    for x in 300 + k * 16..303 + k * 16 {
+                        rb[(y + r) * rw + x + r] = true;
+                    }
+                }
+            }
+        };
+        let (bits, w, e) = run(&specks);
+        assert!(e.is_none() && !bits[15 * w + 305] && !bits[15 * w + 305 + 16]);
     }
 
     // After compose, ink that filled two differently wide slots edge to edge has the same margin on both sides.
