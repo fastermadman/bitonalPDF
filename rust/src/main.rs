@@ -135,11 +135,20 @@ struct Cfg {
 #[derive(Default, Clone)]
 struct Meta {
     rot: u32,
+    conf: f32, // own detector's confidence; 1 when the turn is not in doubt (#52)
     angle: f32,
     w: i64,
     trim: Option<[i64; 4]>, // x0 y0 x1 y1
     cand: bool,
     gutter: Option<(i64, i64)>, // x, width
+}
+
+/// The quarter turn most confident pages agree on; no pages or a tie for first place -> 0 (#52).
+fn majority_turn(rots: impl Iterator<Item = u32>) -> u32 {
+    let mut n = [0usize; 4];
+    rots.for_each(|r| n[(r / 90 % 4) as usize] += 1);
+    let max = *n.iter().max().unwrap();
+    if max == 0 || n.iter().filter(|&&c| c == max).count() > 1 { 0 } else { n.iter().position(|&c| c == max).unwrap() as u32 * 90 }
 }
 
 /// What pass B cuts from a page: nothing (whole page), one box, or a split at gx.
@@ -219,7 +228,21 @@ fn main() {
 
     // Pass A: geometry per page. Only needed for crop/split, or to find the page skew first.
     let geometry = cfg.crop || cfg.split != Split::Off || cfg.rotate || (cfg.deskew && cfg.deskew_first);
-    let metas: Vec<Meta> = if geometry { par_pages(&data, n, |p, i| measure(p, i, &cfg)) } else { vec![Meta::default(); n] };
+    let metas: Vec<Meta> = if geometry { par_pages(&data, n, |p, i| measure(p, i, &cfg, None)) } else { vec![Meta::default(); n] };
+    let mut metas = metas;
+    // #52: pages the own detector is unsure of (conf < gate, left at 0) follow the document's majority quarter turn.
+    if cfg.rotate && !cfg.tess {
+        let q = majority_turn(metas.iter().filter(|m| m.conf >= OSD_OWN_MIN_CONFIDENCE).map(|m| m.rot));
+        if q != 0 {
+            let low: Vec<usize> = (0..n).filter(|&i| metas[i].conf < OSD_OWN_MIN_CONFIDENCE).collect();
+            let redo = par_pages(&data, n, |p, i| if low.contains(&i) { Some(measure(p, i, &cfg, Some(q))) } else { None });
+            for (m, r) in metas.iter_mut().zip(redo) {
+                if let Some(r) = r {
+                    *m = r;
+                }
+            }
+        }
+    }
     let t1 = Instant::now();
 
     // Between passes: document medians, per-page plan, one canvas size (same rules as bitonalpdf.sh).
@@ -296,16 +319,21 @@ fn load(page: &Page, cfg: &Cfg, rot: u32) -> Img {
 
 /// Pass A: rotation, skew (deskew-first only), text box and gutter of one page. Measured on a copy
 /// downsampled to the analysis dpi, results scaled back to output pixels.
-fn measure(page: &Page, i: usize, cfg: &Cfg) -> Meta {
+fn measure(page: &Page, i: usize, cfg: &Cfg, force_rot: Option<u32>) -> Meta {
     let t0 = Instant::now();
     let (g, _) = page_gray(page, cfg.dpi, false);
     let mut g = Img { w: g.w as usize, h: g.h as usize, px: g.px.iter().map(|&v| v as f32 / 255.0).collect() };
-    let rot = match (cfg.rotate, cfg.tess) {
-        (false, _) => 0,
-        (true, true) => osd(&g),
-        (true, false) => match osd_own(&g, OSD_KA, OSD_KD, OSD_TILE) {
+    let mut conf = 1.0;
+    let rot = match (cfg.rotate, cfg.tess, force_rot) {
+        (false, _, _) => 0,
+        (_, _, Some(q)) => q,
+        (true, true, _) => osd(&g),
+        (true, false, _) => match osd_own(&g, OSD_KA, OSD_KD, OSD_TILE) {
             (q, c) if c >= OSD_OWN_MIN_CONFIDENCE => q,
-            _ => 0,
+            (_, c) => {
+                conf = c;
+                0
+            }
         },
     };
     g = rot90(&g, rot);
@@ -321,7 +349,7 @@ fn measure(page: &Page, i: usize, cfg: &Cfg) -> Meta {
     let ink: Vec<bool> = flat.px.iter().map(|&v| v <= 0.6).collect();
     let (w, h) = (g.w as i64, g.h as i64);
     let kk = k as i64;
-    let mut m = Meta { rot, angle, w, cand: w as f64 / h as f64 >= DOUBLE_AR_MIN, ..Default::default() };
+    let mut m = Meta { rot, conf, angle, w, cand: w as f64 / h as f64 >= DOUBLE_AR_MIN, ..Default::default() };
     let mut bx = (0, flat.w);
     let (fw, fh) = (flat.w, flat.h);
     if cfg.crop || cfg.split != Split::Off {
@@ -1587,14 +1615,22 @@ fn osd_eval(data: &Arc<Vec<u8>>, n: usize) {
             let c = ratio * asym.abs();
             let own_ms = t0.elapsed().as_millis();
             let (t, tms) = if tess { let t0 = Instant::now(); (osd(&x) as i64, t0.elapsed().as_millis()) } else { (-1, 0) };
-            format!(
+            let l = format!(
                 "page {} turn {r} expect {} own {d} conf {c:.2} ratio {ratio:.2} asym {asym:.3} own_ms {own_ms} tess {t} tess_ms {tms}",
                 i + 1,
                 (360 - r) % 360
-            )
+            );
+            (l, d, c)
         }).collect::<Vec<_>>()
     });
-    rows.into_iter().flatten().for_each(|l| println!("{l}"));
+    // #52: document = all pages turned the same way; a page under the gate takes the majority of the confident ones.
+    for q in 0..4 {
+        let vote = majority_turn(rows.iter().map(|r| &r[q]).filter(|x| x.2 >= OSD_OWN_MIN_CONFIDENCE).map(|x| x.1));
+        for r in &rows {
+            let (l, d, c) = &r[q];
+            println!("{l} final {}", if *c >= OSD_OWN_MIN_CONFIDENCE { *d } else { vote });
+        }
+    }
 }
 
 /// #43 measurement, no rules: candidate picture-vs-text signals for every page and every DET_TILE square of it, one
