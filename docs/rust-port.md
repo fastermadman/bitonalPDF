@@ -1392,6 +1392,17 @@ comes out readable. The other 44 are illustrations without text, text pages with
 #79 has a use and a local hold-out set. Limits: the search is a heuristic and can miss pages; outputs of v053 and v002 hits not
 seen (split / no output file); 4 crashed files were searched but not rendered.
 
+### JPEG 2000 crash (#97)
+The 4 crashed files (v108, v128, v131, v167) panic in `hayro-jpeg2000` 0.3.5 (`j2c/codestream.rs:150`, `image_width / target_width`).
+hayro's renderer takes the target size from the image's transform (`renderer.rs`, `draw_image`), so an image drawn with a
+zero-length axis gives target 0. 0.4.0 fixes the line (`checked_div`) but cannot be used: the released `hayro-syntax` 0.7.2 needs
+`^0.3.5`, and with 0.4.0 patched in it fails to build (8 API errors). Fix: `rust/vendor/hayro-jpeg2000` is 0.3.5 with that one change
+(`[patch.crates-io]` in `rust/Cargo.toml`); drop it when hayro moves to 0.4.
+Result (same flags as #96): v108 11 pages in / 11 out (13.0 s wall), v128 10 / 10 (7.4 s), v131 11 / 11 (10.7 s), v167 1 / 2 (4.6 s; an
+A3 double page, split). `tests/verify.sh` with `BASE_BIN` = main: ok, all 13 real files identical. Not measured: the other 197 files
+(the change only affects a call that panicked before). Looked at v108 p1 (source upright, output turned 180°: sheet music, not #97)
+and v167 p1 (readable).
+
 ## 9. B4c: colour policy with information over size (#74)
 
 Question: what keeps colour or grey, and who decides (user, automatic, automatic with a printed suggestion), now that

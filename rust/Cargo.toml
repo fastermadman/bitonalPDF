@@ -9,3 +9,8 @@ hayro = "0.7.1"
 jpeg-encoder = "0.7.1"
 kurbo = "0.13.1"
 pdf-writer = "0.15.0"
+
+# #97: hayro-jpeg2000 0.3.5 divides by a zero target size (a degenerate image draw). 0.4.0 fixes it with checked_div, but the released
+# hayro-syntax 0.7.2 still needs ^0.3.5 and does not build against 0.4.0. Vendored with that one change; drop when hayro moves to 0.4.
+[patch.crates-io]
+hayro-jpeg2000 = { path = "vendor/hayro-jpeg2000" }
