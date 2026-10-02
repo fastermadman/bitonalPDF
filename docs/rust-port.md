@@ -1547,3 +1547,38 @@ grey source page stays 1-bit (the list fixes it). Unverifiable here: seven scans
 - **B2j (#79):** the per-component blur-width choice of 9.3 (text mode, covers).
 - §5.7 conditional issues 3 (`auto` detector) and 4 (coloured text as G4 + colour) stay conditional; issue 4 now also needs
   the flat-vs-continuous signal of 9.2 on non-photographed sources.
+
+### 9.6 B4e: `--colour-pages LIST|none` and the crop decision (#76)
+**Decision: a listed slot is the whole slot** (turned, split at the gutter, deskewed; no text box, no keep rule), shown at the
+text canvas' page size with its 150-dpi pixels intact. Unlisted slots are untouched. [measured, labels?, scans]
+
+Reproduce: a temporary `BITONAL_PLANDUMP` print of the plan box, own trim box, page size and canvas per page (removed again),
+`--rotate --crop --split auto --deskew` on f1–f7, region fractions from `work/labels.tsv`; lists from the labels (a slot is
+listed when a region reaches it, f7 p7 whole: 42 slots, as §9.1's label list). Distances in mm at 300 dpi.
+- **What the text-mode plan box cuts** (the box `finish` crops, not §5.1's own trim box): **12 of 46** regions are not fully
+  covered (own trim box: 15). Worst: f7 p1 55,1 % (124,5 mm), f3 p1 73,1 % (40,2 mm), f4 p1 81,1 % (7,7 mm), f1 p12 83,3 % (25,1 mm),
+  f5 p1 90,2 % (19,3 mm), f5 p6 92,8 % (19,3 mm). Box pages (f2, f5) get the document's *median* box, split pages their *own*
+  trim box (`plan()`); f2 p1 is whole under the median (100 %) but 68,1 % under its own trim box.
+- **f7 p1 is a wraparound jacket** (back, spine, front) photographed flat. The gutter lands on the spine (x 2173 of 4299), the text
+  box ends at x 2785 and drops the front cover's big white-on-colour letters. Not rotation (angle 0, turn 0) and not the halving.
+- **Rejected:** (a) "everything that is not paper": the dark table counts as not-paper, so the extent is the whole page on every
+  page looked at; a real book-outline detector (find the bright page) is a new detector, and would gain little on f7 p1 and risks
+  cutting dark plates (f1 p8). (b) The neighbours' half-width around the gutter as a floor, own box on top: 11 of 46 regions
+  still not 100 % (f7 p1 91,7 %, 14,4 mm), the rest sits in the outer margin where a text box never reaches.
+- **Cost of the whole slot:** the slot is not resampled; it is centred on white on a canvas with the text canvas' aspect
+  ratio, at least the canvas at 150 dpi, and the page is the canvas' size in pt. A slot bigger than the canvas (f6: 0,67 of the
+  canvas) is shown smaller on the page, with all its pixels. Effective size on the page 100–146 dpi, the JPEG itself 150 dpi.
+- **Size on f1–f7 with the label list** (image-stream bytes, `pdfimages -list`): text 5 950 653 B, mixed 11 264 191 B =
+  **1,893×** (target ≤ 1,9×; the tight-crop reference was 1,83×). Per file 1,25–4,25× (f5 4,25×, f7 3,68×: most slots listed). 
+  Page counts equal text mode; **one page size per file**; `pdfimages -list`: G4 stays CCITT (86 pages), listed slots DCT (42).
+- **Unlisted pages byte-identical to main:** all 86 G4 streams equal; without the flag `BASE_BIN=<main> tests/verify.sh` reports
+  every file identical, `verify: ok`. The text pass still runs on listed slots because the canvas is the maximum over all slots.
+- **Page numbers:** guaranteed by construction (nothing is cut; halves are `[0,gx]` and `[gx,w]`), checked by eye on 8 listed pages
+  (top/bottom strips) and 4 whole pages. An OCR strip comparison was tried and is **not** a valid check (digit-only OCR on
+  pictures invents numbers; with the table at the bottom a number moves inward past the strip, f6 p8 "241"). A full per-page
+  list needs a tool that finds the number in the source; not built.
+- **Not done / limits:** the page's dark table and finger edges stay in the JPEG (bytes, not information); an unsplit page
+  `12a`/`12b` warns that it has no half; `--colour-pages auto` and the default list are #78.
+- **"Not smaller" gate:** skipped when `--colour-pages` lists pages (the user asked for colour, a bigger file is expected). Checked on
+  `tests/real`: inputs of 82 kB (1 page), 164 kB (5) and 683 kB (9) become 193 kB, 802 kB and 2 364 kB with every page listed (110–320 kB
+  per JPEG page against about 80 kB per input page); more robust runs there: `ryg-side`, `sidste side helt til margin`, `skewed` (turned 270°, deskewed).
