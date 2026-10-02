@@ -1582,3 +1582,28 @@ listed when a region reaches it, f7 p7 whole: 42 slots, as §9.1's label list). 
 - **"Not smaller" gate:** skipped when `--colour-pages` lists pages (the user asked for colour, a bigger file is expected). Checked on
   `tests/real`: inputs of 82 kB (1 page), 164 kB (5) and 683 kB (9) become 193 kB, 802 kB and 2 364 kB with every page listed (110–320 kB
   per JPEG page against about 80 kB per input page); more robust runs there: `ryg-side`, `sidste side helt til margin`, `skewed` (turned 270°, deskewed).
+
+### 9.7 Vectorising raster content (measured, not worth it; refs #103)
+Question (owner): could figures, or the text of a 1-bit page, be vectors instead of JPEG / G4? Crude test with `potrace` 1.16
+(`-t 8 -O 0.4`, 300 dpi, PDF output) on crops of the f1/f5 labels and on four text-mode output pages. [measured, scans] One run, no
+tuning of the colour quantiser (median cut, 6 or 16 colours; one potrace layer per colour on a background); PSNR against the
+150-dpi crop, the same reference as the JPEG. The test does not show what a careful vectoriser would reach.
+
+| figure (crop) | JPEG q65 150 dpi | vector, 6 colours | vector, 16 colours | 1-bit vector / 1-bit G4 (TIFF) |
+|---|---|---|---|---|
+| f5 p4 pie chart (flat) | 28,3 kB, 38,8 dB | 35,6 kB, 24,4 dB | 1 921 kB, 21,6 dB | 57 kB / 16 kB |
+| f1 p13 cartoon (flat) | 37,2 kB, 33,5 dB | 257 kB, 20,1 dB | 818 kB, 18,0 dB | 37 kB / 8 kB |
+| f1 p15 old map | 153 kB, 28,8 dB | 3 002 kB, 17,7 dB | 3 302 kB, 14,2 dB | 662 kB / 106 kB |
+| f1 p17 grey engraving | 138 kB, 28,1 dB | 2 460 kB, 13,7 dB | 1 360 kB, 11,2 dB | 608 kB / 165 kB |
+
+- **Best case, the pie chart:** clean flat fills and sharp edges, but about the same size as the JPEG (+26 %), and **the text in the
+  diagram is lost**: "At opleve musik" is gone and the other labels are grey on the fill, because dark text pixels were merged into
+  the colour of the slice. A vector figure would need the text kept as its own 1-bit layer (§5.3's mask + colour, which has no gate).
+- **Photos, engravings, maps:** scanner noise and gradients become thousands of small shapes: 10–20× the JPEG, 4–6× G4 even in 1 bit.
+- **Text of a 1-bit page** (text-mode output page, re-traced at 300 dpi): G4 39,5 / 48,9 / 40,6 / 59,7 kB (f3 p6, f4 p5, f6 p3, f2 p9)
+  against 438 / 540 / 485 / 646 kB as potrace PDF (**11× / 11× / 12× / 11×**; 2 000–3 000 paths per page). Every glyph is traced on its
+  own. Text as vectors that is *small* needs the glyphs recognised and shared (a font, i.e. OCR, #4) or at least clustered
+  (a JBIG2 symbol dictionary, #81, which stays raster); neither is potrace.
+- **Verdict:** no for images and for text. The only vector gain worth having is copying a page that is already vector (#103).
+  What a vector figure would give is sharpness when zoomed, not bytes. Not tried: a tuned tracer (`vtracer`, not installed), an
+  edge-preserving quantiser, text kept as a 1-bit layer over a vector figure.
