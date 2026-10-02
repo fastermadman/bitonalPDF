@@ -1,6 +1,6 @@
 // bitonalPDF Rust spike (#28 PDF I/O, #29 image ops): PDF in (embedded page image or render) -> rotate/crop/split/
 // deskew -> 1-bit -> CCITT G4 PDF out. Same CLI as bitonalpdf.sh (text mode):
-//   bitonalpdf [--rotate] [--crop] [--split auto|off|N%] [--deskew] input.pdf [output.pdf] [threshold%=60] [dpi=300]
+//   bitonalpdf [--rotate] [--crop] [--split auto|off|N%] [--deskew] [--colour-pages LIST|none] input.pdf [output.pdf] [threshold%=60] [dpi=300]
 // BITONAL_TIMING=1 prints per-page geometry and stage times (ms) to stderr; BITONAL_RENDER=1 always renders.
 // A/B knobs for the pipeline-order questions of #29 (docs/rust-port.md section 2):
 //   BITONAL_ADPI=<dpi>      analysis (crop/gutter) resolution, default = dpi (150 flips crop decisions, section 2)
@@ -91,6 +91,7 @@ const TIGHT_RIM: f32 = 0.03; // --crop: white rim around a slot before its box i
 const BLUR_SIGMA: f32 = 30.0; // px at the output dpi, like bash's -blur 0x30
 const COVER_BLUR_SIGMA: f32 = 1000.0; // px, a cover slot's flatten (#71): wider than f5 p1's circles, so fills stay grey
 const SKEW_MAX_DEG: f32 = 10.0;
+const JPEG_DPI: f32 = 150.0; // #76: colour pages are rendered at this dpi (q65, 4:2:0)
 
 struct Gray {
     w: u32,
@@ -128,6 +129,7 @@ struct Cfg {
     whitened: bool, // BITONAL_WHITENED=1 (#63): keep_box lists what it whitens on stderr
     timing: bool,
     tess: bool, // BITONAL_OSD=tesseract: the old detector
+    colour: Vec<(usize, Option<usize>)>, // #76 --colour-pages: input page (0-based), slot (None = all slots)
 }
 
 /// Pass A result for one page, in output-dpi pixels (after the quarter-turn `rot`, and after straightening by
@@ -177,6 +179,7 @@ fn main() {
         keep_d: std::env::var("BITONAL_KEEP_D").ok().and_then(|s| s.parse().ok()).unwrap_or(4.0),
         timing: env("BITONAL_TIMING"),
         tess: std::env::var("BITONAL_OSD").as_deref() == Ok("tesseract"),
+        colour: vec![],
     };
     let mut pos = vec![];
     let mut eval = false;
@@ -199,6 +202,7 @@ fn main() {
                     _ => die("--split auto|off|N%"),
                 }
             }
+            "--colour-pages" => cfg.colour = parse_colour_pages(it.next().map(String::as_str).unwrap_or_else(|| die("--colour-pages LIST|none"))),
             s if s.starts_with("--") => die(&format!("{s}: unknown option")),
             _ => pos.push(a.clone()),
         }
@@ -206,7 +210,7 @@ fn main() {
     if detect {
         return detect_eval(&pos);
     }
-    let input = pos.first().unwrap_or_else(|| die("usage: bitonalpdf [--rotate] [--crop] [--split auto|off|N%] [--deskew] input.pdf [output.pdf] [threshold%] [dpi]"));
+    let input = pos.first().unwrap_or_else(|| die("usage: bitonalpdf [--rotate] [--crop] [--split auto|off|N%] [--deskew] [--colour-pages LIST|none] input.pdf [output.pdf] [threshold%] [dpi]"));
     let output = pos.get(1).cloned().unwrap_or_else(|| format!("{}.1bit.pdf", input.trim_end_matches(".pdf")));
     cfg.thresh = pos.get(2).map_or(60.0, |s| s.parse().unwrap_or_else(|_| die("bad threshold")));
     cfg.dpi = pos.get(3).map_or(300.0, |s| s.parse().unwrap_or_else(|_| die("bad dpi")));
@@ -223,6 +227,9 @@ fn main() {
     let n = Pdf::new(data.clone()).unwrap_or_else(|e| die(&format!("{input}: {e:?}"))).pages().len();
     if eval {
         return osd_eval(&data, n);
+    }
+    if let Some(&(p, _)) = cfg.colour.iter().find(|c| c.0 >= n) {
+        die(&format!("--colour-pages: page {} but the input has {n} pages", p + 1));
     }
     let t0 = Instant::now();
 
@@ -260,8 +267,18 @@ fn main() {
     }
 
     // Pass B: cut, deskew, centre on the canvas, flatten + threshold, G4.
-    let slots: Vec<(u32, u32, Vec<u8>, [usize; 2])> =
-        par_pages(&data, n, |p, i| finish(p, i, &metas[i], plans[i], (tw, th), &cfg)).into_iter().flatten().collect();
+    // #76: which slots of which page are colour pages (the text pass still runs on them: the canvas comes from all slots)
+    let want = |i: usize, slot: usize| cfg.colour.iter().any(|&(p, s)| p == i && s.is_none_or(|s| s == slot));
+    let nslots = |p: &Plan| if matches!(p, Plan::Split(..)) { 2 } else { 1 };
+    let col: Vec<[bool; 2]> = (0..n).map(|i| [want(i, 0), nslots(&plans[i]) > 1 && want(i, 1)]).collect();
+    for &(p, s) in &cfg.colour {
+        if s.is_some_and(|s| s >= nslots(&plans[p])) {
+            eprintln!("Warning: --colour-pages: page {} has no {} half (not split)", p + 1, if s == Some(0) { "left" } else { "right" });
+        }
+    }
+    eprintln!("colour pages: {}", colour_list(&col, &plans));
+    let (slots, colour): (Vec<(u32, u32, Vec<u8>, [usize; 2])>, Vec<Option<Rgb>>) =
+        par_pages(&data, n, |p, i| finish(p, i, &metas[i], plans[i], (tw, th), col[i], &cfg)).into_iter().flatten().unzip();
     let pages: Vec<(u32, u32, Vec<u8>)> =
         if cfg.crop { compose(slots) } else { slots.into_iter().map(|(w, h, g, _)| (w, h, g)).collect() };
     let t2 = Instant::now();
@@ -269,7 +286,15 @@ fn main() {
         eprintln!("pass A {} ms, pass B {} ms", (t1 - t0).as_millis(), (t2 - t1).as_millis());
     }
 
-    let pdf = write_pdf(&pages, cfg.dpi);
+    let slots: Vec<Slot> = pages
+        .into_iter()
+        .zip(colour)
+        .map(|((w, h, g4), c)| match c {
+            Some(rgb) => colour_slot(&rgb, (w, h), cfg.dpi),
+            None => Slot::G4(w, h, g4),
+        })
+        .collect();
+    let pdf = write_slots(&slots, cfg.dpi);
     let (in_len, out_len) = (data.len(), pdf.len());
     if out_len >= in_len {
         println!("Not smaller ({in_len} B is already small) — no file written");
@@ -456,7 +481,7 @@ fn plan(metas: &[Meta], cfg: &Cfg) -> (Vec<Plan>, Vec<usize>) {
 
 /// Pass B: one or two finished slots (w, h, G4) for a page.
 /// With --crop: instead of G4, the slot's ink box packed 1 bit/px plus the text block's anchor in it (centre x, top y).
-fn finish(page: &Page, i: usize, m: &Meta, plan: Plan, (tw, th): (i64, i64), cfg: &Cfg) -> Vec<(u32, u32, Vec<u8>, [usize; 2])> {
+fn finish(page: &Page, i: usize, m: &Meta, plan: Plan, (tw, th): (i64, i64), col: [bool; 2], cfg: &Cfg) -> Vec<((u32, u32, Vec<u8>, [usize; 2]), Option<Rgb>)> {
     let t0 = Instant::now();
     let mut src = load(page, cfg, m.rot);
     let t1 = Instant::now();
@@ -472,6 +497,12 @@ fn finish(page: &Page, i: usize, m: &Meta, plan: Plan, (tw, th): (i64, i64), cfg
         Plan::Box(b) => vec![b],
         Plan::Split([x0, y0, x1, y1], gx) => vec![[x0, y0, gx, y1], [gx, y0, x1, y1]],
     };
+    // #76: the colour slots are the whole slot (page or half up to the gutter), same rotation, split and deskew, no box
+    let whole = match plan {
+        Plan::Split(_, gx) => vec![[0, 0, gx, h], [gx, 0, w, h]],
+        _ => vec![[0, 0, w, h]],
+    };
+    let planes = col.iter().any(|&c| c).then(|| colour_planes(page, m));
     let tight = cfg.crop;
     let extent = tw > 0 && !matches!(plan, Plan::Whole);
     let mut angles = vec![];
@@ -488,6 +519,7 @@ fn finish(page: &Page, i: usize, m: &Meta, plan: Plan, (tw, th): (i64, i64), cfg
                 0.0
             };
             angles.push(angle);
+            let colour = planes.as_ref().filter(|_| col[slot]).map(|p| colour_cut(p, whole[slot], angle, cfg));
             let (cw, ch) = if tight {
                 // own size, enlarged so no corner is cut, plus a white rim so content_box's edge rules never bite
                 let (sn, cs) = angle.to_radians().abs().sin_cos();
@@ -587,15 +619,90 @@ fn finish(page: &Page, i: usize, m: &Meta, plan: Plan, (tw, th): (i64, i64), cfg
                         }
                     }
                 }
-                return (w as u32, h as u32, packed, [w / 2, 0]);
+                return ((w as u32, h as u32, packed, [w / 2, 0]), colour);
             }
-            (c.w as u32, c.h as u32, encode_g4(&bits, c.w as u32), [0, 0])
+            ((c.w as u32, c.h as u32, encode_g4(&bits, c.w as u32), [0, 0]), colour)
         })
         .collect();
     if cfg.timing {
         eprintln!("B page {}: get {} ms, rest {} ms, deskew {:?}", i + 1, (t1 - t0).as_millis(), t1.elapsed().as_millis(), angles);
     }
     out
+}
+
+/// --colour-pages LIST (#76): `12` = both halves of input page 12, `12a`/`12b` = left/right, comma separated; `none` = no colour pages.
+fn parse_colour_pages(list: &str) -> Vec<(usize, Option<usize>)> {
+    if list == "none" {
+        return vec![];
+    }
+    list.split(',')
+        .map(|t| {
+            let (num, half) = match t.strip_suffix('a') {
+                Some(n) => (n, Some(0)),
+                None => t.strip_suffix('b').map_or((t, None), |n| (n, Some(1))),
+            };
+            match num.parse::<usize>() {
+                Ok(p) if p >= 1 => (p - 1, half),
+                _ => die(&format!("--colour-pages: bad entry '{t}' (use 12, 12a, 12b or none)")),
+            }
+        })
+        .collect()
+}
+
+/// The list actually used, in the --colour-pages syntax, to copy and correct.
+fn colour_list(col: &[[bool; 2]], plans: &[Plan]) -> String {
+    let l: Vec<String> = col
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| match *c {
+            [true, true] => Some(format!("{}", i + 1)),
+            [true, false] if !matches!(plans[i], Plan::Split(..)) => Some(format!("{}", i + 1)),
+            [true, false] => Some(format!("{}a", i + 1)),
+            [false, true] => Some(format!("{}b", i + 1)),
+            _ => None,
+        })
+        .collect();
+    if l.is_empty() { "none".into() } else { l.join(",") }
+}
+
+/// The page as three colour planes at JPEG_DPI, turned and straightened like `load` plus the pass-A angle in `finish`.
+fn colour_planes(page: &Page, m: &Meta) -> [Img; 3] {
+    let g = page_rgb(page, JPEG_DPI);
+    let (w, h) = (g.w as usize, g.h as usize);
+    [0, 1, 2].map(|c| {
+        let p = rot90(&Img { w, h, px: g.px.iter().skip(c).step_by(3).map(|&v| v as f32 / 255.0).collect() }, m.rot);
+        if m.angle != 0.0 { rotate(&p, m.angle, p.w, p.h, 1.0) } else { p }
+    })
+}
+
+/// One whole slot (`b`: output-dpi pixels of the turned page) as RGB at JPEG_DPI, deskewed by the slot's angle on a canvas
+/// big enough that no corner is cut (as in the text slot), white fill.
+fn colour_cut(planes: &[Img; 3], b: [i64; 4], angle: f32, cfg: &Cfg) -> Rgb {
+    let k = JPEG_DPI / cfg.dpi;
+    let crops = planes.each_ref().map(|p| crop(p, b.map(|v| (v as f32 * k).round() as i64)));
+    let (sn, cs) = angle.to_radians().abs().sin_cos();
+    let (w, h) = (crops[0].w as f32, crops[0].h as f32);
+    let (cw, ch) = ((w * cs + h * sn).ceil() as usize, (h * cs + w * sn).ceil() as usize);
+    let r = crops.map(|c| rotate(&c, angle, cw, ch, 1.0));
+    let px = (0..cw * ch).flat_map(|i| [0, 1, 2].map(|c| (r[c].px[i] * 255.0).round().clamp(0.0, 255.0) as u8)).collect();
+    Rgb { w: cw as u32, h: ch as u32, px }
+}
+
+/// A colour page for a cut slot: the slot placed centred on white, no resampling, on a canvas with the text canvas' aspect
+/// ratio and at least its size at JPEG_DPI, and `pt` = the text canvas (cw x ch px at `dpi`), so the page size is the same
+/// as the G4 pages'. A slot bigger than the canvas is shown smaller on the page, with its JPEG_DPI pixels intact.
+fn colour_slot(g: &Rgb, (cw, ch): (u32, u32), dpi: f32) -> Slot {
+    let (k, ar) = (JPEG_DPI / dpi, cw as f32 / ch as f32);
+    let jw = (cw as f32 * k).max(g.w as f32).max(g.h as f32 * ar).ceil() as u32;
+    let jh = (jw as f32 / ar).ceil() as u32;
+    let (ox, oy) = ((jw - g.w) / 2, (jh - g.h.min(jh)) / 2);
+    let mut px = vec![255u8; (jw * jh * 3) as usize];
+    for y in 0..g.h.min(jh) {
+        let (s, d) = ((y * g.w * 3) as usize, (((y + oy) * jw + ox) * 3) as usize);
+        px[d..d + g.w as usize * 3].copy_from_slice(&g.px[s..s + g.w as usize * 3]);
+    }
+    let pt = (cw as f32 * 72.0 / dpi, ch as f32 * 72.0 / dpi);
+    jpeg_slot(&Rgb { w: jw, h: jh, px }, pt)
 }
 
 /// --crop (#55): which ink of a deskewed slot to keep, as connected components. Seeds: components that
@@ -1001,8 +1108,7 @@ fn page_gray(page: &Page, dpi: f32, smooth: bool) -> (Gray, &'static str) {
 }
 
 /// An 8-bit RGB raster, 3 bytes per pixel.
-// ponytail: unused until B4e (#76) picks the colour pages. Always rendered, no Probe shortcut: a source JPEG would be re-encoded anyway.
-#[allow(dead_code)]
+// ponytail: Always rendered, no Probe shortcut: a source JPEG would be re-encoded anyway.
 struct Rgb {
     w: u32,
     h: u32,
@@ -1010,7 +1116,6 @@ struct Rgb {
 }
 
 /// The page rendered as RGB at `dpi`, same pixel size as `page_gray`. On demand: the text path never calls it.
-#[allow(dead_code)]
 fn page_rgb(page: &Page, dpi: f32) -> Rgb {
     let (pw, ph) = page.render_dimensions();
     let s = dpi / 72.0;
@@ -1852,14 +1957,12 @@ fn encode_g4(bits: &[bool], w: u32) -> Vec<u8> {
 
 /// A finished output page. G4: 1-bit, page size in pt = px*72/dpi. Jpeg: the MediaBox is given (`pt`), so a 150-dpi
 /// colour page can sit on the 300-dpi text canvas' page size.
-#[allow(dead_code)] // Jpeg is unused until B4e (#76)
 enum Slot {
     G4(u32, u32, Vec<u8>),
     Jpeg { w: u32, h: u32, data: Vec<u8>, pt: (f32, f32) },
 }
 
 /// RGB -> baseline JPEG, 4:2:0, quality `q` (the encoder's default tables are the IJG ones).
-#[allow(dead_code)]
 fn encode_jpeg(g: &Rgb, q: u8) -> Vec<u8> {
     let mut out = Vec::new();
     let mut enc = jpeg_encoder::Encoder::new(&mut out, q);
@@ -1870,11 +1973,11 @@ fn encode_jpeg(g: &Rgb, q: u8) -> Vec<u8> {
 
 /// A colour page (q65) for a finished RGB slot, on a page of `pt` points.
 // #76: crop, split and deskew are done on bits in Pass B today; the RGB slot must have them applied before it gets here.
-#[allow(dead_code)]
 fn jpeg_slot(g: &Rgb, pt: (f32, f32)) -> Slot {
     Slot::Jpeg { w: g.w, h: g.h, data: encode_jpeg(g, 65), pt }
 }
 
+#[cfg(test)]
 fn write_pdf(pages: &[(u32, u32, Vec<u8>)], dpi: f32) -> Vec<u8> {
     let slots: Vec<Slot> = pages.iter().map(|(w, h, g4)| Slot::G4(*w, *h, g4.clone())).collect();
     write_slots(&slots, dpi)
@@ -1937,6 +2040,21 @@ mod tests {
         let (g, src) = page_gray(page, dpi, true);
         assert_eq!((src, g.w, g.h), ("image", w, h));
         assert!(g.px.iter().zip(&bits).all(|(&p, &b)| (p < 128) == b));
+    }
+
+    // #76: the list syntax, the list printed back, and a colour page that keeps the text canvas' page size and aspect.
+    #[test]
+    fn colour_pages_list_and_slot() {
+        assert_eq!(parse_colour_pages("12,3a,4b"), vec![(11, None), (2, Some(0)), (3, Some(1))]);
+        assert!(parse_colour_pages("none").is_empty());
+        let plans = [Plan::Whole, Plan::Split([0, 0, 2, 2], 1), Plan::Split([0, 0, 2, 2], 1)];
+        assert_eq!(colour_list(&[[true, false], [true, false], [true, true]], &plans), "1,2a,3");
+        assert_eq!(colour_list(&[[false; 2]; 3], &plans), "none");
+        // slot bigger than the canvas (at JPEG_DPI): pixels kept, page size = canvas
+        let g = Rgb { w: 600, h: 500, px: vec![10; 600 * 500 * 3] };
+        let Slot::Jpeg { w, h, pt, .. } = colour_slot(&g, (800, 1000), 300.0) else { panic!() };
+        assert!(w >= 600 && h >= 500 && (w as f32 / h as f32 - 0.8).abs() < 0.01);
+        assert_eq!(pt, (800.0 * 72.0 / 300.0, 1000.0 * 72.0 / 300.0));
     }
 
     // One PDF, G4 + JPEG + G4 pages, one page size: hayro decodes all three, G4 stays exact, the JPEG page is the source
