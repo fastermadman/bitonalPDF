@@ -296,7 +296,7 @@ fn main() {
         .collect();
     let pdf = write_slots(&slots, cfg.dpi);
     let (in_len, out_len) = (data.len(), pdf.len());
-    if out_len >= in_len {
+    if out_len >= in_len && cfg.colour.is_empty() {  // #76: colour pages were asked for, so a bigger file is expected
         println!("Not smaller ({in_len} B is already small) — no file written");
         return;
     }

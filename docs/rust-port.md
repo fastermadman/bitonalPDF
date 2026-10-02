@@ -1579,3 +1579,6 @@ listed when a region reaches it, f7 p7 whole: 42 slots, as §9.1's label list). 
   list needs a tool that finds the number in the source; not built.
 - **Not done / limits:** the page's dark table and finger edges stay in the JPEG (bytes, not information); an unsplit page
   `12a`/`12b` warns that it has no half; `--colour-pages auto` and the default list are #78.
+- **"Not smaller" gate:** skipped when `--colour-pages` lists pages (the user asked for colour, a bigger file is expected). Checked on
+  `tests/real`: inputs of 82 kB (1 page), 164 kB (5) and 683 kB (9) become 193 kB, 802 kB and 2 364 kB with every page listed (110–320 kB
+  per JPEG page against about 80 kB per input page); more robust runs there: `ryg-side`, `sidste side helt til margin`, `skewed` (turned 270°, deskewed).
